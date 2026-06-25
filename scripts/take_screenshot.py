@@ -3,10 +3,12 @@
 
 Portal behaviour:
   - Cookie consent banner must be dismissed first.
-  - Language is switched by clicking the German flag button whose src
-    contains '/assets/icons/flags/de-DE.svg'.
+  - Language is Angular-controlled via localStorage. We click the DE flag,
+    read back the localStorage key it sets, then re-inject it on every
+    navigation so Angular boots in German.
   - /date/YYYY-MM-DD does NOT auto-switch the visible tab – must click it.
-  - After tab click we poll until panel content changes (Angular re-render).
+  - "oder"-alternatives after a price line belong to the same slot and are
+    shown as a second line "oder: <name>" in the dish name.
 """
 import os, re
 from pathlib import Path
@@ -119,9 +121,46 @@ def day_key(dt_obj):
     short = ['Mo','Di','Mi','Do','Fr']
     return f"{short[dt_obj.weekday()]} {dt_obj.strftime('%d.%m')}"
 
-# ── Cookie banner + German language setup ────────────────────────────────
+# ── Language localStorage helper ──────────────────────────────────────────────
+# After clicking the DE flag we read back every localStorage key that changed
+# and re-inject them on subsequent navigations so Angular boots in German.
+_LANG_STORAGE: dict = {}   # populated by warmup()
+
+JS_DUMP_STORAGE = """
+() => {
+  var out = {};
+  for (var i = 0; i < localStorage.length; i++) {
+    var k = localStorage.key(i);
+    out[k] = localStorage.getItem(k);
+  }
+  return JSON.stringify(out);
+}
+"""
+
+JS_INJECT_STORAGE = """
+(pairs) => {
+  pairs.forEach(function(p){ localStorage.setItem(p[0], p[1]); });
+}
+"""
+
+def _snapshot_storage(page):
+    try:
+        raw = page.evaluate(JS_DUMP_STORAGE)
+        import json; return json.loads(raw)
+    except Exception:
+        return {}
+
+def _inject_lang_storage(page):
+    if not _LANG_STORAGE:
+        return
+    pairs = list(_LANG_STORAGE.items())
+    try:
+        page.evaluate(JS_INJECT_STORAGE, pairs)
+    except Exception as e:
+        print(f"  [lang] inject failed: {e}")
+
+# ── Cookie + language warmup ──────────────────────────────────────────────────
 def dismiss_cookie_banner(page):
-    """Try all known cookie consent selectors. Silent if none found."""
     for sel in [
         "text=Got it!",
         "button:has-text('Got it')",
@@ -143,58 +182,63 @@ def dismiss_cookie_banner(page):
             pass
     return False
 
-
 def switch_to_german(page):
     """
-    Click the German flag button. The portal uses img src
-    '/assets/icons/flags/de-DE.svg' as the language switcher.
-    After clicking, wait for a German-language selector to confirm.
+    Click the DE flag img, capture any localStorage changes, store globally
+    so we can re-inject them after every navigation.
     """
-    FLAG_SEL = "img[src*='de-DE']"
-    # The img may be inside a button or anchor – try the image itself
-    # and also its parent button/a.
+    global _LANG_STORAGE
+    before = _snapshot_storage(page)
+
     JS_CLICK_FLAG = r"""
     (function(){
       var img = document.querySelector("img[src*='de-DE']");
       if (!img) return 'not found';
       var btn = img.closest('button,a') || img;
       btn.click();
-      return btn.tagName + ' clicked: ' + (img.getAttribute('src') || '');
+      return btn.tagName + ': ' + (img.getAttribute('src') || '');
     })()
     """
     try:
-        # Wait for the flag image to appear in the DOM
-        page.wait_for_selector(FLAG_SEL, timeout=8000)
+        page.wait_for_selector("img[src*='de-DE']", timeout=8000)
         result = page.evaluate(JS_CLICK_FLAG)
         print(f"  [lang] flag click: {result}")
-        # Wait for Angular to re-render in German
-        for de_sel in ["text=Suppe", "text=Suppe / Vorspeise", "text=Essen 1",
-                       "text=Do.", "text=Fr.", "text=Mo."]:
+        page.wait_for_timeout(1500)   # Angular re-render
+
+        after = _snapshot_storage(page)
+        # Find keys that were added or changed
+        diff = {k: v for k, v in after.items() if before.get(k) != v}
+        if diff:
+            _LANG_STORAGE = diff
+            print(f"  [lang] localStorage diff: {list(diff.keys())}")
+        else:
+            # Fallback: store common language keys explicitly
+            _LANG_STORAGE = {k: 'de' for k in
+                ['language','locale','lang','i18n','selectedLanguage','appLanguage']}
+            print(f"  [lang] no diff found, using fallback keys")
+
+        for de_sel in ["text=Suppe", "text=Suppe / Vorspeise", "text=Essen 1"]:
             try:
-                page.wait_for_selector(de_sel, timeout=4000)
+                page.wait_for_selector(de_sel, timeout=3000)
                 print(f"  [lang] German confirmed: {de_sel!r}")
                 return True
             except Exception:
                 pass
-        print("  [lang] flag clicked but German selector not confirmed")
+        print("  [lang] German not confirmed yet (may work after reload)")
         return False
     except Exception as e:
-        print(f"  [lang] flag button not found: {e}")
+        print(f"  [lang] flag not found: {e}")
         return False
 
-
 def warmup(page, base_url):
-    """Load the base URL, dismiss cookie banner, switch to German."""
     print("  [warmup] loading base URL...")
     try:
         page.goto(base_url, wait_until="domcontentloaded", timeout=40000)
     except Exception as e:
-        print(f"  [warmup] goto failed: {e}")
-        return
-    page.wait_for_timeout(1500)   # let Angular bootstrap
+        print(f"  [warmup] goto failed: {e}"); return
+    page.wait_for_timeout(1500)
     dismiss_cookie_banner(page)
     switch_to_german(page)
-
 
 # ── Parser ────────────────────────────────────────────────────────────────────
 CAT_HEADERS = {
@@ -217,6 +261,7 @@ CAT_HEADERS = {
     'Fisch':    'Essen 3',
 }
 
+# Exact whole-line labels that open a new vegan/veg sub-slot.
 VEGAN_LABELS = {
     'Vegan':        'VG',
     'Vegetarian':   'V',
@@ -251,7 +296,16 @@ def _norm_price(raw):
     except ValueError: return raw
 
 def parse_flat(lines):
+    """
+    Parse innerText lines into dish list.
+
+    "oder"-alternatives after a committed dish stay in the SAME slot and are
+    appended as "oder: <name>" to the existing entry instead of being dropped.
+    """
     dishes=[]; cur_cat=None; cur_vv=''; cur_name=[]; seen_cats=set()
+    after_oder = False   # True while collecting the alternative name
+    oder_name  = []      # tokens of the alternative
+
     SLOTS=['Suppe','Essen 1','Essen 2','Essen 3']
 
     def next_free(slot):
@@ -260,7 +314,7 @@ def parse_flat(lines):
         return next((s for s in SLOTS[idx+1:] if s not in seen_cats), None)
 
     def flush(price=''):
-        nonlocal cur_name, cur_vv
+        nonlocal cur_name, cur_vv, after_oder, oder_name
         toks=[t for t in cur_name
               if not ALLERGEN_RE.match(t) and not OR_RE.match(t)
               and t not in NOISE and not INT_PRICE_RE.search(t)
@@ -269,27 +323,67 @@ def parse_flat(lines):
         name=' '.join(toks).strip()
         if cur_cat and name and len(name)>=3 and cur_cat not in seen_cats:
             dishes.append({'kategorie':cur_cat,'name':name,
-                           'preis_int':price+'\u00a0\u20ac' if price else '','vv':cur_vv})
+                           'preis_int':price+'\u00a0\u20ac' if price else '','vv':cur_vv,
+                           'oder':''})
             seen_cats.add(cur_cat)
         cur_name=[]; cur_vv=''
+        after_oder=False; oder_name=[]
+
+    def flush_oder():
+        """Append collected oder-alternative to the last committed dish in cur_cat."""
+        nonlocal after_oder, oder_name
+        toks=[t for t in oder_name
+              if not ALLERGEN_RE.match(t) and t not in NOISE
+              and not INT_PRICE_RE.search(t) and not EXT_RE.match(t)]
+        while toks and ALLERGEN_RE.match(toks[-1]): toks.pop()
+        name=' '.join(toks).strip()
+        if name and len(name)>=3:
+            # Find last dish in this slot and append
+            for dish in reversed(dishes):
+                if dish['kategorie']==cur_cat:
+                    dish['oder'] = name
+                    break
+        after_oder=False; oder_name=[]
 
     for line in lines:
         line=line.strip()
         if not line or line in NOISE: continue
+
         if line in CAT_HEADERS:
+            if after_oder: flush_oder()
             flush(); cur_cat=CAT_HEADERS[line]; cur_name=[]; cur_vv=''; continue
+
         if cur_cat is None: continue
+
         if line in VEGAN_LABELS:
+            if after_oder: flush_oder()
             flush()
             nxt=next_free(cur_cat)
             if nxt: cur_cat=nxt
             cur_vv=VEGAN_LABELS[line]; cur_name=[]; continue
-        m=INT_PRICE_RE.search(line)
-        if m: flush(_norm_price(m.group(1) or m.group(2) or '')); continue
-        if OR_RE.match(line): seen_cats.add(cur_cat); cur_name=[]; cur_vv=''; continue
-        if EXT_RE.match(line) or ALLERGEN_RE.match(line): continue
-        cur_name.append(line)
 
+        m=INT_PRICE_RE.search(line)
+        if m:
+            if after_oder:
+                # Price for the oder-alternative: just finalise it
+                flush_oder()
+            else:
+                flush(_norm_price(m.group(1) or m.group(2) or ''))
+            continue
+
+        if OR_RE.match(line):
+            # Don't close the slot – start collecting the alternative
+            if after_oder: flush_oder()   # nested oder, unlikely but safe
+            after_oder=True; oder_name=[]; continue
+
+        if EXT_RE.match(line) or ALLERGEN_RE.match(line): continue
+
+        if after_oder:
+            oder_name.append(line)
+        else:
+            cur_name.append(line)
+
+    if after_oder: flush_oder()
     flush()
     return dishes
 
@@ -340,12 +434,14 @@ def scrape_day(page, date_obj):
     print(f"  Loading {url}  [{date_label}]")
 
     page.goto(url, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(800)
+    page.wait_for_timeout(600)
 
-    # Dismiss cookie banner in case it re-appears
+    # Re-inject language localStorage so Angular boots in German
+    _inject_lang_storage(page)
+    page.wait_for_timeout(400)
+
     dismiss_cookie_banner(page)
 
-    # Wait for any category header
     found_sel = None
     for sel in [
         "text=Suppe / Vorspeise", "text=Suppe", "text=Essen 1",
@@ -353,17 +449,15 @@ def scrape_day(page, date_obj):
     ]:
         try:
             page.wait_for_selector(sel, timeout=12000)
-            found_sel = sel
-            break
+            found_sel = sel; break
         except Exception:
             pass
     if not found_sel:
-        print("    no menu selector found, extra wait 5s")
+        print("    no menu selector, extra wait 5s")
         page.wait_for_timeout(5000)
     else:
         page.wait_for_timeout(400)
 
-    # Click the correct day tab and wait for Angular re-render
     before_sig = ' '.join(get_tab_text(page)[:6])
     clicked    = page.evaluate(f"({JS_CLICK_TAB})('{date_label}')")
     print(f"    tab click: {clicked!r}")
@@ -372,8 +466,7 @@ def scrape_day(page, date_obj):
         for _ in range(20):
             page.wait_for_timeout(200)
             if ' '.join(get_tab_text(page)[:6]) != before_sig:
-                print("    content changed")
-                break
+                print("    content changed"); break
         else:
             print("    content unchanged (same tab?)")
     else:
@@ -382,11 +475,11 @@ def scrape_day(page, date_obj):
 
     lines = get_tab_text(page)
     print(f"    lines: {len(lines)}")
-    for i, l in enumerate(lines[:30]):
+    for i, l in enumerate(lines[:35]):
         print(f"      {i:2d}: {l[:110]}")
 
     dishes = parse_flat(lines)
-    print(f"    -> {[(d['kategorie'], d['vv'], d['name'][:22]) for d in dishes]}")
+    print(f"    -> {[(d['kategorie'], d['vv'], d['name'][:20], d['oder'][:15] if d['oder'] else '') for d in dishes]}")
     return dishes
 
 
@@ -410,9 +503,17 @@ CAT_LABEL={'Suppe':'Suppe','Essen 1':'Essen 1','Essen 2':'Essen 2','Essen 3':'Es
 def render(week_data,kw,label,local_dt,url_menu,holiday_map,today_date,source=''):
     img=Image.new('RGB',(W,H),(255,255,255))
     d=ImageDraw.Draw(img)
-    ftit=lf(18,True);fday=lf(13,True);ftxt=lf(12)
-    fbdg=lf(10,True);fprc=lf(10);fftr=lf(10);fstb=lf(10,True)
-    HDR_H=44;DAY_H=26;LEGEND_H=20;STUB_W=52
+    # ── Fonts – bigger sizes for better readability ───────────────────────────
+    ftit=lf(20,True)   # header title
+    fday=lf(15,True)   # day column header
+    ftxt=lf(15)        # dish name  ← was 12
+    fsmall=lf(13)      # oder-alternative  ← was 12
+    fbdg=lf(12,True)   # vegan/veg badge
+    fprc=lf(12)        # price
+    fftr=lf(10)        # footer
+    fstb=lf(11,True)   # row stub label
+
+    HDR_H=48; DAY_H=28; LEGEND_H=22; STUB_W=56
 
     d.rectangle([(0,0),(W,HDR_H)],fill=BLUE)
     title=f'Siemens Kantine Regensburg  \u2502  KW {kw:02d}'
@@ -436,7 +537,7 @@ def render(week_data,kw,label,local_dt,url_menu,holiday_map,today_date,source=''
     y+=DAY_H
 
     avail=H-y-FOOTER_H-LEGEND_H-4
-    rs=int(avail*0.18); re_=(avail-rs)//3
+    rs=int(avail*0.17); re_=(avail-rs)//3
     ROW_H={'Suppe':rs,'Essen 1':re_,'Essen 2':re_,'Essen 3':avail-rs-2*re_}
 
     for ri,cat in enumerate(CATS):
@@ -474,26 +575,43 @@ def render(week_data,kw,label,local_dt,url_menu,holiday_map,today_date,source=''
                     cy=by+bh+5
                     for ln in wrap_text(d,hn,ftxt,dw-8,3):
                         b2=d.textbbox((0,0),ln,font=ftxt)
-                        d.text((x+(dw-(b2[2]-b2[0]))//2,cy),ln,font=ftxt,fill=C_HOL_TXT);cy+=15
+                        d.text((x+(dw-(b2[2]-b2[0]))//2,cy),ln,font=ftxt,fill=C_HOL_TXT);cy+=17
                 continue
 
             PAD=6
             items=[it for it in week_data.get(day,[]) if it['kategorie']==cat]
             if not items:
                 b=d.textbbox((0,0),'–',font=ftxt)
-                d.text((x+(dw-(b[2]-b[0]))//2,y+rh//2-7),'–',font=ftxt,fill=(180,180,180))
+                d.text((x+(dw-(b[2]-b[0]))//2,y+rh//2-8),'–',font=ftxt,fill=(180,180,180))
                 continue
-            it=items[0];cx=x+PAD;cy=y+PAD;avw=dw-2*PAD
+
+            it=items[0]; cx=x+PAD; cy=y+PAD; avw=dw-2*PAD
+
+            # Vegan/Veg badge
             if it['vv']:
                 bl='Vegan' if it['vv']=='VG' else 'Veg.'
                 bc=C_VG if it['vv']=='VG' else C_V
                 b=d.textbbox((0,0),bl,font=fbdg)
                 bw=b[2]-b[0]+7;bh2=b[3]-b[1]+4
                 d.rounded_rectangle([(cx,cy),(cx+bw,cy+bh2)],radius=3,fill=bc)
-                d.text((cx+4,cy+2),bl,font=fbdg,fill=WHITE);cy+=bh2+3
-            max_ln=max(2,min(5,(rh-cy+y-16)//14))
-            for ln in wrap_text(d,it['name'],ftxt,avw,max_ln):
-                d.text((cx,cy),ln,font=ftxt,fill=C_TXT);cy+=15
+                d.text((cx+4,cy+2),bl,font=fbdg,fill=WHITE);cy+=bh2+4
+
+            # Main dish name
+            # Reserve space for oder-line if present
+            oder_lines_needed = 2 if it.get('oder') else 0
+            space_for_oder = oder_lines_needed * 16
+            avail_for_name = rh - (cy - y) - 16 - space_for_oder
+            max_ln = max(1, min(4, avail_for_name // 17))
+            for ln in wrap_text(d, it['name'], ftxt, avw, max_ln):
+                d.text((cx,cy),ln,font=ftxt,fill=C_TXT);cy+=17
+
+            # oder-alternative in smaller italic-style colour
+            if it.get('oder'):
+                oder_str = f"oder: {it['oder']}"
+                for ln in wrap_text(d, oder_str, fsmall, avw, 2):
+                    d.text((cx,cy),ln,font=fsmall,fill=(100,130,160));cy+=16
+
+            # Price bottom-right
             if it['preis_int']:
                 pl=f"Int: {it['preis_int']}"
                 b=d.textbbox((0,0),pl,font=fprc)
@@ -504,10 +622,10 @@ def render(week_data,kw,label,local_dt,url_menu,holiday_map,today_date,source=''
     d.rectangle([(0,y),(W,y+LEGEND_H)],fill=(245,249,253))
     lx=8
     for col,txt in [(C_VG,'Vegan'),(C_V,'Vegetarisch'),(C_HOL_HDR,'Feiertag'),(C_PAST_BG,'vergangen')]:
-        d.rectangle([(lx,y+5),(lx+14,y+14)],fill=col)
+        d.rectangle([(lx,y+5),(lx+14,y+15)],fill=col)
         b=d.textbbox((0,0),txt,font=fprc)
-        d.text((lx+18,y+3),txt,font=fprc,fill=C_TXT);lx+=18+(b[2]-b[0])+18
-    d.text((lx,y+3),'Int = Mitarbeiterpreis',font=fprc,fill=(120,120,120))
+        d.text((lx+18,y+4),txt,font=fprc,fill=C_TXT);lx+=18+(b[2]-b[0])+18
+    d.text((lx,y+4),'Int = Mitarbeiterpreis',font=fprc,fill=(120,120,120))
     _footer(d,kw,label,local_dt,fftr,source)
     return img
 
@@ -554,7 +672,7 @@ def main():
             viewport={"width":1400,"height":900},
             extra_http_headers={"Accept-Language":"de-DE,de;q=0.9,en;q=0.1"},
         )
-        warmup(page, URL_BASE)   # cookie banner + German flag button
+        warmup(page, URL_BASE)
         for date_obj in scrape_dates:
             dk=day_key(date_obj)
             dishes=scrape_day(page,date_obj)
