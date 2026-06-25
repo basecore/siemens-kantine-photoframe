@@ -1,33 +1,20 @@
 #!/usr/bin/env python3
-"""Siemens Kantine Regensburg – weekly menu PDF scraper + 800x600 JPEG renderer.
+"""Siemens Kantine Regensburg – DOM-based menu scraper + 800x600 JPEG renderer.
 
-Strategy:
-  1. Open cateringportal.io with Playwright
-  2. Intercept ALL network responses to catch the qnips PDF URL
-     (the link is not in the HTML but loaded dynamically via JS/API)
-  3. Download the weekly PDF with requests
-  4. Parse menu items from PDF text (dedup + price-pair splitting)
-  5. Render clean 800x600 LANDSCAPE JPEG with Pillow
+The menu data is rendered directly in the HTML by the SPA.
+After waiting for JS, BeautifulSoup extracts the visible text which contains:
+  Mon. 22.06. | Tue. 23.06. | ... dates ...
+  Soup/Starter | Food 1 | Food 2 | Food 3
+  dish name, allergen codes, Int €X.XX Ext €Y.YY
 """
 import os
 import re
-import io
-import requests
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from bs4 import BeautifulSoup
 
 from playwright.sync_api import sync_playwright
 from PIL import Image, ImageDraw, ImageFont
-
-try:
-    import pdfplumber
-except ImportError:
-    pdfplumber = None
-try:
-    from pypdf import PdfReader
-except ImportError:
-    PdfReader = None
+from bs4 import BeautifulSoup
 
 # ── Config ─────────────────────────────────────────────────────────────────
 URL_BASE = os.environ.get(
@@ -39,7 +26,7 @@ _SID = os.environ.get("CATERINGPORTAL_SID", "").strip()
 OUT_DIR  = Path("docs/images")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 MAX_KEEP = 8
-W, H = 800, 600
+W, H     = 800, 600
 FOOTER_H = 22
 
 # ── Colours ─────────────────────────────────────────────────────────────────
@@ -53,7 +40,7 @@ C_TXT  = ( 30,  30,  30)
 WHITE  = (255, 255, 255)
 GRID   = (200, 215, 230)
 
-# ── Font helper ───────────────────────────────────────────────────────────────
+# ── Fonts ───────────────────────────────────────────────────────────────────
 _FREG = ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
          "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"]
 _FBOL = ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -66,7 +53,7 @@ def lf(size, bold=False):
             except OSError: pass
     return ImageFont.load_default()
 
-# ── Time helpers ─────────────────────────────────────────────────────────────
+# ── Time ────────────────────────────────────────────────────────────────────
 def german_time(dt):
     try:
         from zoneinfo import ZoneInfo
@@ -87,191 +74,194 @@ def kw_label(dt):
     y, w, _ = d.isocalendar()
     return f"{y}-W{w:02d}", int(w)
 
-# ── Step 1: Load page, intercept ALL responses for qnips PDF ────────────────────
-def load_page(url: str) -> tuple:
-    """
-    Returns (html, pdf_url_or_None).
-    Intercepts every network response URL to catch qnips PDF links
-    that are set dynamically via JS/API and never appear in the HTML source.
-    """
-    found_pdf = []
-    found_api_json = []
-
+# ── Step 1: Load page ─────────────────────────────────────────────────────────────
+def load_page(url: str) -> str:
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        context = browser.new_context(
+        page = browser.new_page(
             viewport={"width": 1280, "height": 900},
             extra_http_headers={"Accept-Language": "de-DE,de;q=0.9"},
         )
-        page = context.new_page()
-
-        # Intercept every request URL
-        def on_request(req):
-            u = req.url
-            if 'qnips' in u.lower():
-                print(f"  [req] qnips: {u[:140]}")
-            if '.pdf' in u.lower() and 'allergen' not in u.lower():
-                print(f"  [req] PDF: {u[:140]}")
-                found_pdf.append(u)
-
-        # Intercept every response to also catch JSON API payloads
-        def on_response(resp):
-            u = resp.url
-            if 'qnips' in u.lower():
-                print(f"  [resp] qnips: {u[:140]}")
-                # Try to extract PDF URL from JSON response body
-                ct = resp.headers.get('content-type', '')
-                if 'json' in ct or 'text' in ct:
-                    try:
-                        body = resp.text()
-                        # find any qnips or Mittagessen PDF URL in the body
-                        urls = re.findall(
-                            r'https://files\.qnips\.com/[^\s"\'\'<>]+\.pdf[^\s"\'\'<>]*',
-                            body, re.I
-                        )
-                        if urls:
-                            print(f"  [resp-body] PDF URLs: {urls[:3]}")
-                            found_pdf.extend(urls)
-                        else:
-                            # Dump first 300 chars of body for debug
-                            print(f"  [resp-body] (first 300): {body[:300]}")
-                        found_api_json.append((u, body[:2000]))
-                    except Exception as e:
-                        print(f"  [resp-body] error reading body: {e}")
-
-        page.on("request",  on_request)
-        page.on("response", on_response)
-
-        print(f"  Navigating to {url}")
         page.goto(url, wait_until="load", timeout=60000)
-
-        # Wait longer for SPA + API calls to complete
-        print("  Waiting 8s for API calls...")
-        page.wait_for_timeout(8000)
+        print("  Waiting for menu content...")
+        try:
+            page.wait_for_selector("text=Food 1", timeout=10000)
+            print("  'Food 1' found")
+        except Exception:
+            try:
+                page.wait_for_selector("text=Essen 1", timeout=5000)
+                print("  'Essen 1' found")
+            except Exception:
+                print("  fallback timeout")
+                page.wait_for_timeout(6000)
+        page.wait_for_timeout(2000)
         print(f"  Title: {page.title()}")
-
         html = page.content()
         browser.close()
-
     print(f"  HTML size: {len(html):,} bytes")
-    print(f"  PDF URLs intercepted: {found_pdf}")
+    return html
 
-    # Also search raw HTML for any qnips URL
-    html_pdfs = re.findall(
-        r'https://files\.qnips\.com/[^\s"\'\'<>]+\.pdf[^\s"\'\'<>]*',
-        html, re.I
-    )
-    if html_pdfs:
-        print(f"  qnips PDFs in HTML: {html_pdfs[:5]}")
-        found_pdf.extend(html_pdfs)
+# ── Step 2: Parse DOM ───────────────────────────────────────────────────────────────
+CAT_PATTERNS = [
+    (r'Soup\s*/\s*Starter|Suppe',       'Suppe'),
+    (r'Food\s*1|Essen\s*1|Gericht\s*1', 'Essen 1'),
+    (r'Food\s*2|Essen\s*2|Gericht\s*2', 'Essen 2'),
+    (r'Food\s*3|Essen\s*3|Gericht\s*3', 'Essen 3'),
+]
 
-    # Debug: show visible body text
-    soup = BeautifulSoup(html, 'html.parser')
-    for tag in soup(['script','style','noscript']): tag.decompose()
-    body_txt = ' '.join(soup.get_text(' ').split())
-    print(f"  Body text (500 chars): {body_txt[:500]}")
+ALLERGEN_RE = re.compile(
+    r'\s+([A-H](?:\.[1-6])?(?:\s+[A-H](?:\.[1-6])?)*)\s*$'
+)
+PRICE_INT_RE = re.compile(r'Int\s*\u20ac?\s*(\d+[,.]\d{2})', re.I)
+PRICE_EXT_RE = re.compile(r'Ext\s*\u20ac?\s*(\d+[,.]\d{2})', re.I)
+VEGAN_RE     = re.compile(r'\bvegan\b', re.I)
+VEG_RE       = re.compile(r'\bvegetar', re.I)
 
-    pdf_url = found_pdf[0] if found_pdf else None
-    return html, pdf_url
+NOISE_WORDS = {
+    'int','ext','cw:','home','menu','stores','impressum','nutzungsbedingungen',
+    'datenschutzerklärung','close','english','lunch','this','website','uses',
+    'cookies','learn','more','got','it!','siemens','view_compact','place',
+    'menu','home','soup','starter','food','essen','gericht','suppe',
+}
 
-# ── Step 2: Download PDF ─────────────────────────────────────────────────────────
-def download_pdf(url: str) -> bytes:
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; KantinoBot/1.0)"}
-    r = requests.get(url, headers=headers, timeout=30)
-    r.raise_for_status()
-    print(f"  PDF downloaded: {len(r.content):,} bytes")
-    return r.content
-
-# ── Step 3: Extract text from PDF ─────────────────────────────────────────────
-def extract_pdf_text(pdf_bytes: bytes) -> str:
-    if pdfplumber:
-        try:
-            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                pages = [p.extract_text() or '' for p in pdf.pages]
-            text = '\n'.join(pages)
-            if text.strip():
-                print(f"  pdfplumber: {len(text)} chars")
-                return text
-        except Exception as e:
-            print(f"  pdfplumber error: {e}")
-    if PdfReader:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        text = '\n'.join(p.extract_text() or '' for p in reader.pages)
-        print(f"  pypdf: {len(text)} chars")
-        return text
-    raise RuntimeError("No PDF parser available")
-
-# ── Step 4: Parse qnips column layout ─────────────────────────────────────────
-def dedup_text(text):
-    for _ in range(6):
-        text = re.sub(r'([A-Za-z\u00c0-\u017e,\- ]{4,})\1', r'\1', text)
-    return text
-
-def fix_name(name):
-    name = re.sub(r'([a-z\u00e0-\u017e])([A-Z\u00c0-\u00de])', r'\1 \2', name)
-    return re.sub(r'\s+', ' ', name).strip()
-
-def detect_vv(name):
-    low = name.lower()
-    if 'vegan' in low: return 'VG'
-    if 'vegetar' in low: return 'V'
+def detect_vv(text):
+    if VEGAN_RE.search(text): return 'VG'
+    if VEG_RE.search(text):   return 'V'
     return ''
 
-def split_items(body):
-    parts = re.split(r'(?<=\d{2})  +(?=[A-Z\u00c0-\u00de])', body)
-    result = []
-    for part in parts:
-        part = part.strip()
-        if not part: continue
-        m = re.search(r'(\d+,\d{2})(\d+,\d{2})\s*$', part)
-        if not m:
-            m = re.search(r'(\d+,\d{2})\s+(\d+,\d{2})\s*$', part)
-        if m:
-            name  = fix_name(part[:m.start()].strip())
-            price = m.group(1) + ' \u20ac'
-        else:
-            name  = fix_name(part)
-            price = ''
-        if not name or len(name) < 3: continue
-        low = name.lower()
-        skip = ['oder','int.ext','mo - fr','alle preise','all prices',
-                'restaurant','thomas','+49','allergen','monday','tuesday']
-        if any(low.startswith(w) for w in skip): continue
-        if re.match(r'^[\d.,\s\u20ac/]+$', name): continue
-        result.append((name, price))
-    return result
+def strip_allergens(name):
+    return ALLERGEN_RE.sub('', name).strip()
 
-def parse_menu(pdf_text, local_dt):
+def parse_dom(html: str, local_dt: datetime) -> dict:
     monday    = local_dt - timedelta(days=local_dt.weekday())
-    day_labels = [f"{s} {(monday+timedelta(days=i)).strftime('%d.%m')}"
-                  for i, s in enumerate(['Mo','Di','Mi','Do','Fr'])]
+    dates     = [(monday + timedelta(days=i)).strftime('%d.%m') for i in range(5)]
+    day_short = ['Mo','Di','Mi','Do','Fr']
 
-    text = ' '.join(pdf_text.split())
-    text = dedup_text(text)
-    text = re.sub(
-        r'^.*?(?:Restaurant\s+Regensburg|\+49[^\s]+|\d{2}:\d{2}\s+Uhr)\s*',
-        '', text, flags=re.I
-    ).strip()
+    soup = BeautifulSoup(html, 'html.parser')
 
-    items = split_items(text)
-    print(f"  Items extracted: {len(items)}")
-    for i, (n, p) in enumerate(items):
-        print(f"    {i:2d}: {n[:60]!r:65} {p}")
+    # --- Strategy A: find day-column containers by date string ---
+    day_cols = {}
+    for i, date in enumerate(dates):
+        for el in soup.find_all(string=re.compile(re.escape(date))):
+            parent = el.find_parent(['td','th','div','section','article','li'])
+            if parent and date not in str(day_cols):
+                day_key = f"{day_short[i]} {date}"
+                day_cols[day_key] = parent
+                print(f"  Day col [{day_key}]: <{parent.name} class={parent.get('class','')}>"),
+                break
 
-    CATS = ['Suppe', 'Essen 1', 'Essen 2', 'Essen 3']
-    week_data = {day: [] for day in day_labels}
-    for ci, cat in enumerate(CATS):
-        for di, day in enumerate(day_labels):
-            idx = ci * 5 + di
-            if idx < len(items):
-                name, price = items[idx]
-                week_data[day].append({
-                    'kategorie': cat, 'name': name,
-                    'vv': detect_vv(name), 'preis_int': price,
+    if len(day_cols) >= 3:
+        print(f"  Strategy A: {len(day_cols)} columns found")
+        return _parse_columns(day_cols)
+
+    # --- Strategy B: line-by-line flat text ---
+    print("  Strategy B: flat text")
+    return _parse_flat(soup, dates, day_short)
+
+
+def _parse_columns(day_cols: dict) -> dict:
+    week_data = {}
+    for day_key, col_el in day_cols.items():
+        col_text = col_el.get_text(' ', strip=True)
+        print(f"  [{day_key}] text: {col_text[:180]}")
+        meals = []
+        for cat_re, cat_label in CAT_PATTERNS:
+            m = re.search(cat_re, col_text, re.I)
+            if not m: continue
+            rest = col_text[m.end():]
+            # Cut before next category
+            nc = re.search(r'(?:Food\s*[123]|Essen\s*[123]|Soup|Suppe)', rest, re.I)
+            seg = rest[:nc.start()] if nc else rest[:300]
+            # Extract int price
+            pm = PRICE_INT_RE.search(seg)
+            price = pm.group(1) + ' €' if pm else ''
+            # Name: everything before price / allergen block
+            name_raw = seg[:pm.start()] if pm else seg
+            name = strip_allergens(
+                re.sub(r'\s+', ' ', re.sub(r'Int\s*€.*', '', name_raw)).strip()
+            )
+            if name and len(name) >= 3:
+                meals.append({
+                    'kategorie': cat_label, 'name': name,
+                    'vv': detect_vv(seg), 'preis_int': price,
                 })
+        if meals:
+            week_data[day_key] = meals
+    return week_data
+
+
+def _parse_flat(soup, dates, day_short) -> dict:
+    for tag in soup(['script','style','noscript']): tag.decompose()
+    lines = [l.strip() for l in soup.get_text('\n').splitlines() if l.strip()]
+    print(f"  Lines total: {len(lines)}")
+    print("  Lines 0-80:")
+    for i, l in enumerate(lines[:80]):
+        print(f"    {i:3d}: {l[:100]}")
+
+    # Locate date lines
+    day_idx = {}
+    for i, date in enumerate(dates):
+        for li, line in enumerate(lines):
+            if date in line:
+                day_idx[i] = li
+                print(f"  Date {date} at line {li}: {line!r}")
+                break
+
+    if not day_idx:
+        print("  No dates found!")
+        return {}
+
+    # Locate category lines
+    cat_idx = {}
+    after = min(day_idx.values()) + 3
+    for li in range(after, len(lines)):
+        for cat_re, cat_label in CAT_PATTERNS:
+            if re.search(cat_re, lines[li], re.I) and cat_label not in cat_idx:
+                cat_idx[cat_label] = li
+                print(f"  Cat '{cat_label}' at line {li}: {lines[li]!r}")
+
+    print(f"  day_idx={day_idx}  cat_idx={cat_idx}")
+
+    week_data = {f"{day_short[i]} {dates[i]}": [] for i in range(5)}
+    cats_sorted = sorted(cat_idx.items(), key=lambda x: x[1])
+
+    for ci, (cat_label, cat_li) in enumerate(cats_sorted):
+        end_li = cats_sorted[ci+1][1] if ci+1 < len(cats_sorted) else min(cat_li+60, len(lines))
+        block  = lines[cat_li+1:end_li]
+        print(f"  {cat_label} block ({len(block)} lines): {block[:15]}")
+
+        # Collect dish groups separated by Int € price tokens
+        dishes = []; cur = []; cur_price = ''
+        for tok in block:
+            pm = PRICE_INT_RE.search(tok)
+            if pm:
+                cur_price = pm.group(1) + ' €'
+                name = strip_allergens(' '.join(cur))
+                if name and len(name) >= 3:
+                    dishes.append((name, cur_price, detect_vv(' '.join(cur))))
+                cur = []; cur_price = ''
+            elif PRICE_EXT_RE.match(tok):
+                pass  # skip ext price
+            elif tok.lower() not in NOISE_WORDS and not re.match(r'^[€\d,. ]+$', tok):
+                cur.append(tok)
+        if cur:
+            name = strip_allergens(' '.join(cur))
+            if name and len(name) >= 3:
+                dishes.append((name, cur_price, detect_vv(' '.join(cur))))
+
+        print(f"  {cat_label}: {[(n[:40],p) for n,p,_ in dishes]}")
+
+        for di in range(5):
+            if di < len(dishes):
+                name, price, vv = dishes[di]
+                week_data[f"{day_short[di]} {dates[di]}"].append({
+                    'kategorie': cat_label, 'name': name,
+                    'vv': vv, 'preis_int': price,
+                })
+
     return {k: v for k, v in week_data.items() if v}
 
-# ── Step 5: Render 800x600 landscape JPEG ───────────────────────────────────────
+# ── Render 800x600 JPEG ──────────────────────────────────────────────────────────────
 def wrap_text(draw, text, f, max_w):
     words = text.split()
     out, cur = [], ''
@@ -380,30 +370,12 @@ def main():
     print(f'Target URL : {url_menu}')
     print(f'Week label : {label}  (KW {kw:02d})')
 
-    # 1. Load page + intercept network
-    print('Loading page...')
-    html, pdf_url = load_page(url_menu)
+    html = load_page(url_menu)
 
-    if not pdf_url:
-        print('ERROR: No qnips PDF found -> placeholder.')
-        img = render({}, kw, label, local, url_menu)
-        img.save(str(out_path), 'JPEG', quality=92)
-        return
-
-    # 2. Download PDF
-    print(f'Downloading PDF: {pdf_url[:100]}...')
-    pdf_bytes = download_pdf(pdf_url)
-
-    # 3. Extract text
-    print('Extracting PDF text...')
-    pdf_text = extract_pdf_text(pdf_bytes)
-
-    # 4. Parse
-    print('Parsing menu...')
-    week_data = parse_menu(pdf_text, local)
+    print('Parsing DOM...')
+    week_data = parse_dom(html, local)
     print(f'Days parsed: {list(week_data.keys())}')
 
-    # 5. Render
     img = render(week_data, kw, label, local, url_menu)
     img.save(str(out_path), 'JPEG', quality=92)
     print(f'Saved: {out_path}  ({img.size[0]}x{img.size[1]})')
