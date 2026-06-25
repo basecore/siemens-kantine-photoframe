@@ -13,11 +13,6 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  # ─────────────────────────────────────────────────────────────────
-  # Job 1: Scrape + Render + git push (GitHub-hosted)
-  # TODO: upload-haos, upload-fallback und notify wieder aktivieren
-  #       sobald das Bild korrekt gerendert wird.
-  # ─────────────────────────────────────────────────────────────────
   screenshot:
     runs-on: ubuntu-latest
     env:
@@ -30,11 +25,11 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -yq chromium-browser fonts-dejavu curl
-          pip install playwright Pillow beautifulsoup4 lxml
+          pip install playwright Pillow requests pdfplumber pypdf
           python -m playwright install chromium
           python -m playwright install-deps chromium
 
-      - name: Scrape & render menu
+      - name: Scrape PDF & render menu
         id: screenshot
         run: python scripts/take_screenshot.py
 
@@ -59,8 +54,6 @@ jobs:
           git pull --rebase origin main
           git push
 
-      # Bild als Artifact herunterladen (10 Tage verfügbar)
-      # Actions → Run → Artifacts → "kantine-screenshot-debug"
       - name: Upload image as artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -68,14 +61,3 @@ jobs:
           name: kantine-screenshot-debug
           path: docs/images/
           retention-days: 10
-
-  # ─────────────────────────────────────────────────────────────────
-  # TODO: Folgende Jobs wieder einkommentieren sobald Rendering läuft:
-  #
-  # upload-haos:
-  #   ...
-  # upload-fallback:
-  #   ...
-  # notify:
-  #   ...
-  # ─────────────────────────────────────────────────────────────────
