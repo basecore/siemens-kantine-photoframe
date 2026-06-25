@@ -3,10 +3,13 @@
 
 Portal behaviour:
   - Language is always EN in headless mode; both EN+DE labels handled.
-  - "Vegan" / "Vegetarian" on the page is a DISH LABEL (slot = Food 2 / Essen 2),
-    not just a badge. The parser must collect it as a separate dish entry.
+  - "Vegan" / "Vegetarian" as an ISOLATED line (exact match) is a portal
+    sub-slot label – it opens a new dish slot and sets the vv badge.
+  - "Vegane Linsensuppe" (vegan in the NAME) must NOT open a new slot;
+    it only receives the vv badge because cur_vv was set by a prior label.
+    If no label was emitted, the dish gets no badge (correct: the name
+    already describes it).
   - /date/YYYY-MM-DD does NOT auto-switch tab; we click it manually.
-  - After tab click we poll until content changes (Angular re-render).
 """
 import os, re
 from pathlib import Path
@@ -39,7 +42,6 @@ C_HOL_HDR = (140, 140, 140)
 C_HOL_TXT = (100, 100, 100)
 C_PAST_BG  = (235, 235, 235)
 C_PAST_TXT = (160, 160, 160)
-C_CAT_TXT  = (80, 100, 130)
 
 _FREG = ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
          "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"]
@@ -121,7 +123,6 @@ def day_key(dt_obj):
     return f"{short[dt_obj.weekday()]} {dt_obj.strftime('%d.%m')}"
 
 # ── Parser ────────────────────────────────────────────────────────────────────
-# Category header tokens (EN + DE)
 CAT_HEADERS = {
     'Soup / Starter':    'Suppe',
     'Soup/Starter':      'Suppe',
@@ -142,8 +143,9 @@ CAT_HEADERS = {
     'Fisch':    'Essen 3',
 }
 
-# "Vegan" / "Vegetarian" as standalone lines are dish LABELS used by the portal
-# as a sub-slot inside a category – treat them as a new virtual category entry.
+# Exact-match standalone lines that open a new dish sub-slot.
+# IMPORTANT: these must be the COMPLETE line content (stripped).
+# "Vegane Linsensuppe" is NOT in this dict – it stays as a name token.
 VEGAN_LABELS = {
     'Vegan':        'VG',
     'Vegetarian':   'V',
@@ -181,30 +183,22 @@ def _norm_price(raw: str) -> str:
 
 def parse_flat(lines: list) -> list:
     """
-    Parse flat innerText lines into dish list.
-    Each entry: {kategorie, name, preis_int, vv}
-
-    Key insight: when the portal shows a Vegan alternative inside e.g. Food 1,
-    it emits:
-        Food 1
-        <meat dish name>
-        <allergens>
-        Int  €X.XX
-        Ext  €Y.YY
-        Vegan          <-- standalone label starts a NEW virtual slot
-        <vegan dish>
-        Int  €X.XX
-        ...
-    We map the first dish to 'Essen 1' and the Vegan sub-dish to 'Essen 2'
-    (next free slot).
+    Rules:
+    1. CAT_HEADERS line  → new slot, reset name buffer.
+    2. VEGAN_LABELS line (exact whole-line match only)
+                         → flush current dish, advance to next free slot,
+                           set cur_vv badge. Does NOT add the word to the name.
+    3. INT_PRICE line    → commit buffered name as dish entry with that price.
+    4. vv badge comes ONLY from cur_vv set by rule 2.
+       It is NEVER inferred from words in the dish name (e.g. 'Vegane Linsensuppe'
+       gets no badge unless the standalone 'Vegan' label preceded it).
     """
     dishes    = []
-    cur_cat   = None       # internal category slot name
-    cur_vv    = ''         # '' / 'V' / 'VG' set when Vegan/Veg label seen
+    cur_cat   = None
+    cur_vv    = ''       # set ONLY by an exact VEGAN_LABELS line
     cur_name  = []
-    seen_cats = set()      # slots already committed
+    seen_cats = set()
 
-    # slot advancement: when we see Vegan inside a slot, advance to next free
     SLOTS = ['Suppe', 'Essen 1', 'Essen 2', 'Essen 3']
 
     def next_free_slot(after_slot):
@@ -226,19 +220,17 @@ def parse_flat(lines: list) -> list:
             and t not in NOISE
             and not INT_PRICE_RE.search(t)
             and not EXT_RE.match(t)
-            and t not in VEGAN_LABELS   # don't include the label in the name
         ]
         while toks and ALLERGEN_RE.match(toks[-1]):
             toks.pop()
         name = ' '.join(toks).strip()
         if cur_cat and name and len(name) >= 3 and cur_cat not in seen_cats:
-            low = name.lower()
-            vv  = cur_vv or ('VG' if 'vegan' in low else ('V' if 'vegetar' in low else ''))
+            # vv badge: ONLY from explicit label, never auto-detected from name
             dishes.append({
                 'kategorie': cur_cat,
                 'name':      name,
                 'preis_int': price + '\u00a0\u20ac' if price else '',
-                'vv':        vv,
+                'vv':        cur_vv,
             })
             seen_cats.add(cur_cat)
         cur_name = []
@@ -249,10 +241,10 @@ def parse_flat(lines: list) -> list:
         if not line or line in NOISE:
             continue
 
-        # ── Category header ──────────────────────────────────────────────────
+        # 1. Category header
         if line in CAT_HEADERS:
             flush()
-            cur_cat = CAT_HEADERS[line]
+            cur_cat  = CAT_HEADERS[line]
             cur_name = []
             cur_vv   = ''
             continue
@@ -260,26 +252,24 @@ def parse_flat(lines: list) -> list:
         if cur_cat is None:
             continue
 
-        # ── Standalone Vegan / Vegetarian label ──────────────────────────────
+        # 2. Standalone vegan/veg label – exact whole-line match
+        #    "Vegane Linsensuppe" has len > any key, so it will NOT match here.
         if line in VEGAN_LABELS:
-            # Flush the current (meat) dish first
-            # Then advance cur_cat to next free slot and set vv badge
-            flush()
+            flush()                          # commit current (meat) dish
             nxt = next_free_slot(cur_cat)
             if nxt:
                 cur_cat = nxt
-            cur_vv   = VEGAN_LABELS[line]
+            cur_vv   = VEGAN_LABELS[line]    # badge for the NEXT dish only
             cur_name = []
             continue
 
-        # ── Int price → commit dish ──────────────────────────────────────────
+        # 3. Int price → commit
         m = INT_PRICE_RE.search(line)
         if m:
-            price_str = _norm_price(m.group(1) or m.group(2) or '')
-            flush(price_str)
+            flush(_norm_price(m.group(1) or m.group(2) or ''))
             continue
 
-        # ── or/oder → first alternative done; block second ───────────────────
+        # or/oder → skip second alternative in same slot
         if OR_RE.match(line):
             seen_cats.add(cur_cat)
             cur_name = []
@@ -291,6 +281,7 @@ def parse_flat(lines: list) -> list:
         if ALLERGEN_RE.match(line):
             continue
 
+        # 4. Regular name token – add as-is (including "Vegane ...", "Vegan-...")
         cur_name.append(line)
 
     flush()
@@ -331,10 +322,7 @@ JS_CLICK_TAB = r"""
     var t = (el.innerText || el.textContent || '').trim();
     return t.includes(dateStr);
   });
-  if (target) {
-    target.click();
-    return (target.innerText || target.textContent || '').trim();
-  }
+  if (target) { target.click(); return (target.innerText||target.textContent||'').trim(); }
   return null;
 })
 """
@@ -370,32 +358,29 @@ def scrape_day(page, date_obj) -> list:
     else:
         page.wait_for_timeout(500)
 
-    text_before = get_tab_text(page)
-    before_sig  = ' '.join(text_before[:6])
-
-    clicked = page.evaluate(f"({JS_CLICK_TAB})('{date_label}')")
+    before_sig = ' '.join(get_tab_text(page)[:6])
+    clicked    = page.evaluate(f"({JS_CLICK_TAB})('{date_label}')")
     print(f"    tab click: {clicked!r}")
 
     if clicked:
         for _ in range(20):
             page.wait_for_timeout(200)
-            new_lines = get_tab_text(page)
-            if ' '.join(new_lines[:6]) != before_sig:
-                print("    content changed after tab click")
+            if ' '.join(get_tab_text(page)[:6]) != before_sig:
+                print("    content changed")
                 break
         else:
-            print("    content unchanged (already on correct tab?)")
+            print("    content unchanged (same tab?)")
     else:
-        print(f"    no tab found for {date_label}, using current content")
+        print(f"    no tab for {date_label}, using current")
         page.wait_for_timeout(800)
 
     lines = get_tab_text(page)
-    print(f"    tab lines: {len(lines)}")
+    print(f"    lines: {len(lines)}")
     for i, l in enumerate(lines[:30]):
         print(f"      {i:2d}: {l[:110]}")
 
     dishes = parse_flat(lines)
-    print(f"    -> {[(d['kategorie'], d['name'][:25]) for d in dishes]}")
+    print(f"    -> {[(d['kategorie'], d['vv'], d['name'][:22]) for d in dishes]}")
     return dishes
 
 
@@ -416,97 +401,58 @@ def wrap_text(draw, text, f, max_w, max_lines=4):
     return out[:max_lines]
 
 CATS = ['Suppe', 'Essen 1', 'Essen 2', 'Essen 3']
-
-# Human-readable row labels shown in the leftmost stub column
-CAT_LABEL = {
-    'Suppe':   'Suppe',
-    'Essen 1': 'Essen 1',
-    'Essen 2': 'Essen 2',
-    'Essen 3': 'Essen 3',
-}
+CAT_LABEL = {'Suppe':'Suppe','Essen 1':'Essen 1','Essen 2':'Essen 2','Essen 3':'Essen 3'}
 
 def render(week_data, kw, label, local_dt, url_menu, holiday_map,
            today_date, source=''):
-
     img = Image.new('RGB', (W, H), (255, 255, 255))
     d   = ImageDraw.Draw(img)
+    ftit=lf(18,True); fday=lf(13,True)
+    ftxt=lf(12);      fbdg=lf(10,True); fprc=lf(10); fftr=lf(10); fstb=lf(10,True)
+    HDR_H=44; DAY_H=26; LEGEND_H=20; STUB_W=52
 
-    # Font sizes scaled for 1200×800
-    ftit = lf(18, True)
-    fday = lf(13, True)
-    fcat = lf(10, True)
-    ftxt = lf(12)
-    fbdg = lf(10, True)
-    fprc = lf(10)
-    fftr = lf(10)
-    fstb = lf(10, True)   # stub column
-
-    HDR_H    = 44
-    DAY_H    = 26
-    LEGEND_H = 20
-    STUB_W   = 52          # left row-label column width
-
-    # ── Header ───────────────────────────────────────────────────────────────
+    # Header
     d.rectangle([(0,0),(W,HDR_H)], fill=BLUE)
     title = f'Siemens Kantine Regensburg  \u2502  KW {kw:02d}'
     b = d.textbbox((0,0), title, font=ftit)
-    d.text(((W-(b[2]-b[0]))//2, (HDR_H-(b[3]-b[1]))//2), title, font=ftit, fill=WHITE)
+    d.text(((W-(b[2]-b[0]))//2,(HDR_H-(b[3]-b[1]))//2), title, font=ftit, fill=WHITE)
     y = HDR_H
 
-    all_days = list(holiday_map.keys())   # always 5 days Mo–Fr
-    n_days   = len(all_days)
-    grid_w   = W - STUB_W
-    dw       = grid_w // n_days
+    all_days = list(holiday_map.keys())
+    dw = (W - STUB_W) // len(all_days)
 
-    # ── Day header row ────────────────────────────────────────────────────────
-    # Stub corner
+    # Day headers
     d.rectangle([(0,y),(STUB_W-1,y+DAY_H-1)], fill=BLUE)
     for i, day in enumerate(all_days):
         x = STUB_W + i*dw
         is_hol  = holiday_map[day] is not None
         is_past = _is_past(day, today_date)
-        hdr_col = C_HOL_HDR if is_hol else (C_PAST_TXT if is_past else LIGHT)
-        d.rectangle([(x,y),(x+dw-1,y+DAY_H-1)], fill=hdr_col)
+        col = C_HOL_HDR if is_hol else (C_PAST_TXT if is_past else LIGHT)
+        d.rectangle([(x,y),(x+dw-1,y+DAY_H-1)], fill=col)
         b = d.textbbox((0,0), day, font=fday)
-        d.text((x+(dw-(b[2]-b[0]))//2, y+(DAY_H-(b[3]-b[1]))//2),
-               day, font=fday, fill=WHITE)
+        d.text((x+(dw-(b[2]-b[0]))//2, y+(DAY_H-(b[3]-b[1]))//2), day, font=fday, fill=WHITE)
         d.line([(x,y),(x,y+DAY_H)], fill=BLUE, width=1)
     y += DAY_H
 
-    # ── Data rows ─────────────────────────────────────────────────────────────
     avail = H - y - FOOTER_H - LEGEND_H - 4
-    # Row height distribution: Suppe 18%, rest equal
     rs  = int(avail * 0.18)
     re_ = (avail - rs) // 3
-    ROW_H = {
-        'Suppe':   rs,
-        'Essen 1': re_,
-        'Essen 2': re_,
-        'Essen 3': avail - rs - 2*re_,
-    }
+    ROW_H = {'Suppe':rs,'Essen 1':re_,'Essen 2':re_,'Essen 3':avail-rs-2*re_}
 
     for ri, cat in enumerate(CATS):
         rh = ROW_H[cat]
         d.line([(0,y),(W,y)], fill=GRID, width=1)
 
-        # Stub label
-        bg_stub = R_ODD if ri % 2 == 0 else R_EVEN
+        # Stub label (rotated)
         d.rectangle([(0,y),(STUB_W-1,y+rh-1)], fill=BLUE)
-        label_txt = CAT_LABEL[cat]
-        # Rotate-like stacking: write vertically centered
-        b = d.textbbox((0,0), label_txt, font=fstb)
-        tw, th = b[2]-b[0], b[3]-b[1]
-        # Draw rotated text via temporary image
-        import math
-        tmp = Image.new('RGBA', (th+4, tw+4), (0,0,0,0))
+        lbl = CAT_LABEL[cat]
+        b   = d.textbbox((0,0), lbl, font=fstb)
+        tmp = Image.new('RGBA', (b[3]-b[1]+4, b[2]-b[0]+4), (0,0,0,0))
         td  = ImageDraw.Draw(tmp)
-        td.text((2,2), label_txt, font=fstb, fill=WHITE)
+        td.text((2,2), lbl, font=fstb, fill=WHITE)
         tmp_r = tmp.rotate(90, expand=True)
-        px = (STUB_W - tmp_r.width)  // 2
-        py = y + (rh - tmp_r.height) // 2
-        img.paste(tmp_r, (max(0,px), max(y,py)), tmp_r)
+        img.paste(tmp_r, (max(0,(STUB_W-tmp_r.width)//2), max(y,y+(rh-tmp_r.height)//2)), tmp_r)
 
-        # Day cells
         for i, day in enumerate(all_days):
             x = STUB_W + i*dw
             is_hol  = holiday_map[day] is not None
@@ -517,79 +463,61 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map,
 
             if is_past:
                 if ri == 0:
-                    msg = 'vergangen'
-                    b = d.textbbox((0,0), msg, font=fprc)
-                    d.text((x+(dw-(b[2]-b[0]))//2, y+rh//2-6),
-                           msg, font=fprc, fill=C_PAST_TXT)
+                    b = d.textbbox((0,0),'vergangen',font=fprc)
+                    d.text((x+(dw-(b[2]-b[0]))//2,y+rh//2-6),'vergangen',font=fprc,fill=C_PAST_TXT)
                 continue
 
             if is_hol:
                 if ri == 0:
-                    hname = holiday_map[day]
-                    b = d.textbbox((0,0), 'Feiertag', font=fbdg)
+                    hn = holiday_map[day]
+                    b  = d.textbbox((0,0),'Feiertag',font=fbdg)
                     bw=b[2]-b[0]+8; bh=b[3]-b[1]+5
                     bx=x+(dw-bw)//2; by=y+8
-                    d.rounded_rectangle([(bx,by),(bx+bw,by+bh)], radius=4, fill=(160,160,160))
-                    d.text((bx+4,by+2), 'Feiertag', font=fbdg, fill=WHITE)
-                    cy = by+bh+5
-                    for ln in wrap_text(d, hname, ftxt, dw-8, 3):
-                        b2 = d.textbbox((0,0), ln, font=ftxt)
-                        d.text((x+(dw-(b2[2]-b2[0]))//2, cy), ln, font=ftxt, fill=C_HOL_TXT)
-                        cy += 15
+                    d.rounded_rectangle([(bx,by),(bx+bw,by+bh)],radius=4,fill=(160,160,160))
+                    d.text((bx+4,by+2),'Feiertag',font=fbdg,fill=WHITE)
+                    cy=by+bh+5
+                    for ln in wrap_text(d,hn,ftxt,dw-8,3):
+                        b2=d.textbbox((0,0),ln,font=ftxt)
+                        d.text((x+(dw-(b2[2]-b2[0]))//2,cy),ln,font=ftxt,fill=C_HOL_TXT); cy+=15
                 continue
 
             PAD = 6
-            items = [it for it in week_data.get(day, []) if it['kategorie'] == cat]
+            items = [it for it in week_data.get(day,[]) if it['kategorie']==cat]
             if not items:
-                b = d.textbbox((0,0), '–', font=ftxt)
-                d.text((x+(dw-(b[2]-b[0]))//2, y+rh//2-7), '–', font=ftxt, fill=(180,180,180))
+                b = d.textbbox((0,0),'–',font=ftxt)
+                d.text((x+(dw-(b[2]-b[0]))//2,y+rh//2-7),'–',font=ftxt,fill=(180,180,180))
                 continue
 
-            it = items[0]
-            cx = x + PAD; cy = y + PAD; avw = dw - 2*PAD
-
-            # Vegan/Veg badge
+            it = items[0]; cx=x+PAD; cy=y+PAD; avw=dw-2*PAD
             if it['vv']:
-                bl = 'Vegan' if it['vv'] == 'VG' else 'Veg.'
-                bc = C_VG   if it['vv'] == 'VG' else C_V
-                b  = d.textbbox((0,0), bl, font=fbdg)
-                bw = b[2]-b[0]+7; bh2 = b[3]-b[1]+4
-                d.rounded_rectangle([(cx,cy),(cx+bw,cy+bh2)], radius=3, fill=bc)
-                d.text((cx+4,cy+2), bl, font=fbdg, fill=WHITE)
-                cy += bh2 + 3
+                bl='Vegan' if it['vv']=='VG' else 'Veg.'
+                bc=C_VG if it['vv']=='VG' else C_V
+                b=d.textbbox((0,0),bl,font=fbdg)
+                bw=b[2]-b[0]+7; bh2=b[3]-b[1]+4
+                d.rounded_rectangle([(cx,cy),(cx+bw,cy+bh2)],radius=3,fill=bc)
+                d.text((cx+4,cy+2),bl,font=fbdg,fill=WHITE); cy+=bh2+3
 
-            # Dish name – use more lines for bigger cells
-            max_ln = max(2, min(5, (rh - cy + y - 16) // 14))
-            for ln in wrap_text(d, it['name'], ftxt, avw, max_ln):
-                d.text((cx, cy), ln, font=ftxt, fill=C_TXT)
-                cy += 15
+            max_ln = max(2, min(5,(rh-cy+y-16)//14))
+            for ln in wrap_text(d,it['name'],ftxt,avw,max_ln):
+                d.text((cx,cy),ln,font=ftxt,fill=C_TXT); cy+=15
 
-            # Price bottom-right
             if it['preis_int']:
-                pl = f"Int: {it['preis_int']}"
-                b  = d.textbbox((0,0), pl, font=fprc)
-                d.text((x+dw-(b[2]-b[0])-PAD, y+rh-(b[3]-b[1])-4),
-                       pl, font=fprc, fill=LIGHT)
+                pl=f"Int: {it['preis_int']}"
+                b=d.textbbox((0,0),pl,font=fprc)
+                d.text((x+dw-(b[2]-b[0])-PAD,y+rh-(b[3]-b[1])-4),pl,font=fprc,fill=LIGHT)
         y += rh
 
-    # ── Legend ────────────────────────────────────────────────────────────────
-    d.line([(0,y),(W,y)], fill=GRID, width=1); y += 1
-    d.rectangle([(0,y),(W,y+LEGEND_H)], fill=(245,249,253))
-    items_leg = [
-        (C_VG,       'Vegan'),
-        (C_V,        'Vegetarisch'),
-        (C_HOL_HDR,  'Feiertag'),
-        (C_PAST_BG,  'vergangen'),
-    ]
-    lx = 8
-    for col, txt in items_leg:
-        d.rectangle([(lx,y+5),(lx+14,y+14)], fill=col)
-        b = d.textbbox((0,0), txt, font=fprc)
-        d.text((lx+18, y+3), txt, font=fprc, fill=C_TXT)
-        lx += 18 + (b[2]-b[0]) + 18
-    d.text((lx, y+3), 'Int = Mitarbeiterpreis', font=fprc, fill=(120,120,120))
-
-    _footer(d, kw, label, local_dt, fftr, source)
+    # Legend
+    d.line([(0,y),(W,y)],fill=GRID,width=1); y+=1
+    d.rectangle([(0,y),(W,y+LEGEND_H)],fill=(245,249,253))
+    lx=8
+    for col,txt in [(C_VG,'Vegan'),(C_V,'Vegetarisch'),(C_HOL_HDR,'Feiertag'),(C_PAST_BG,'vergangen')]:
+        d.rectangle([(lx,y+5),(lx+14,y+14)],fill=col)
+        b=d.textbbox((0,0),txt,font=fprc)
+        d.text((lx+18,y+3),txt,font=fprc,fill=C_TXT)
+        lx+=18+(b[2]-b[0])+18
+    d.text((lx,y+3),'Int = Mitarbeiterpreis',font=fprc,fill=(120,120,120))
+    _footer(d,kw,label,local_dt,fftr,source)
     return img
 
 
@@ -600,14 +528,14 @@ def _is_past(day_key_str, today_date):
     except Exception:
         return False
 
-def _footer(d, kw, label, local_dt, f, source=''):
-    src = f' \u2013 {source}' if source else ''
-    txt = (f'KW {kw:02d} / {label}  \u2013  '
-           f"{local_dt.strftime('%d.%m.%Y %H:%M Uhr')}  \u2013  "
-           f"siemens.cateringportal.io{src}")
-    d.rectangle([(0,H-FOOTER_H),(W,H)], fill=BLUE)
-    b = d.textbbox((0,0), txt, font=f)
-    d.text(((W-(b[2]-b[0]))//2, H-18), txt, font=f, fill=WHITE)
+def _footer(d,kw,label,local_dt,f,source=''):
+    src=f' \u2013 {source}' if source else ''
+    txt=(f'KW {kw:02d} / {label}  \u2013  '
+         f"{local_dt.strftime('%d.%m.%Y %H:%M Uhr')}  \u2013  "
+         f"siemens.cateringportal.io{src}")
+    d.rectangle([(0,H-FOOTER_H),(W,H)],fill=BLUE)
+    b=d.textbbox((0,0),txt,font=f)
+    d.text(((W-(b[2]-b[0]))//2,H-18),txt,font=f,fill=WHITE)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
