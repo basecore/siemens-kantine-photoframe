@@ -65,6 +65,49 @@ def get_week_label(utc_dt: datetime) -> str:
     return f"{iso_year}-W{iso_week:02d}"
 
 
+def goto_with_fallback(page, url: str):
+    """Navigate to URL, falling back from networkidle → load → domcontentloaded."""
+    for wait_until in ("load", "domcontentloaded"):
+        try:
+            print(f"  Trying wait_until='{wait_until}'...")
+            page.goto(url, wait_until=wait_until, timeout=60000)
+            print(f"  Navigation succeeded (wait_until='{wait_until}').")
+            return
+        except Exception as e:
+            print(f"  wait_until='{wait_until}' failed: {e}")
+    # Last resort: fire-and-forget with commit
+    print("  Trying wait_until='commit' (last resort)...")
+    page.goto(url, wait_until="commit", timeout=60000)
+    print("  Navigation commit succeeded.")
+
+
+def wait_for_content(page):
+    """Wait for the menu table to appear in the DOM (up to 30 s)."""
+    # Cateringportal renders a table or a list of dishes – wait for any visible text block
+    candidates = [
+        "table",
+        ".menu-item",
+        ".meal",
+        ".dish",
+        "[class*='menu']",
+        "[class*='meal']",
+        "[class*='dish']",
+        "main",
+        "#content",
+        "#app",
+    ]
+    for sel in candidates:
+        try:
+            page.wait_for_selector(sel, timeout=15000, state="visible")
+            print(f"  Content visible: '{sel}'")
+            return
+        except Exception:
+            pass
+    # No specific selector matched – just wait a fixed time
+    print("  No specific content selector matched – waiting 8 s for JS render.")
+    page.wait_for_timeout(8000)
+
+
 def dismiss_consent_banner(page):
     """Dismiss GDPR/cookie consent banner if present."""
     iframe_selectors = [
@@ -84,8 +127,8 @@ def dismiss_consent_banner(page):
             if btn.count() > 0:
                 btn.first.click(timeout=6000)
                 print(f"Consent dismissed via iframe ({iframe_sel})")
-                page.wait_for_load_state("networkidle", timeout=15000)
-                page.wait_for_timeout(1500)
+                # Don't wait for networkidle here – just a fixed pause
+                page.wait_for_timeout(2000)
                 return True
         except Exception as e:
             print(f"iframe strategy ({iframe_sel}) failed: {e}")
@@ -135,7 +178,6 @@ def dismiss_consent_banner(page):
             if loc.count() > 0:
                 loc.first.click(timeout=5000)
                 print(f"Consent banner dismissed with direct selector: {sel}")
-                page.wait_for_load_state("networkidle", timeout=15000)
                 page.wait_for_timeout(1500)
                 return True
         except Exception as e:
@@ -175,7 +217,6 @@ def hide_chrome(page):
 def add_date_bar(img: Image.Image, utc_dt: datetime) -> Image.Image:
     """Draw a date/time bar at the bottom of the image (deutsche Zeit, 24h-Format)."""
     local_dt = get_german_time(utc_dt)
-    week_label = get_week_label(utc_dt)
     date_str = f"KW {local_dt.isocalendar()[1]:02d} – {local_dt.strftime('%d.%m.%Y %H:%M Uhr')} – Siemens Kantine Regensburg"
     bar_h = 22
     bar_y = img.height - bar_h
@@ -222,19 +263,27 @@ def main():
         page = browser.new_page(viewport={"width": VIEW_W, "height": VIEW_H})
 
         print("Navigating to Cateringportal Speiseplan...")
-        page.goto(URL_MENU, wait_until="networkidle", timeout=60000)
+        goto_with_fallback(page, URL_MENU)
+
+        # Wait for actual menu content to render (SPA may need JS time)
+        print("Waiting for menu content...")
+        wait_for_content(page)
+
+        # Extra settle time for lazy-loaded images / animations
         page.wait_for_timeout(3000)
         print(f"Page title: {page.title()}")
 
-        page.wait_for_timeout(2000)
         dismiss_consent_banner(page)
         page.wait_for_timeout(1000)
         hide_chrome(page)
+        # Final settle after hiding chrome
+        page.wait_for_timeout(1000)
 
         page.screenshot(path=str(png_path), full_page=False)
+        print(f"Screenshot saved to {png_path}")
         browser.close()
 
-    # --- Resize / crop to exact 800x600 landscape for Philips 8FF3WMI ---
+    # --- Resize / scale to exact 800x600 landscape for Philips 8FF3WMI ---
     img = Image.open(png_path).convert("RGB")
     w, h = img.size
     print(f"Raw screenshot size: {w}x{h}")
