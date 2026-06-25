@@ -3,7 +3,7 @@ name: Weekly Kantine Screenshot
 on:
   workflow_dispatch:
   schedule:
-    # Jeden Montag 05:30 UTC = 07:30 CEST (Speiseplan ist i.d.R. montags online)
+    # Jeden Montag 05:30 UTC = 07:30 CEST
     - cron: '30 5 * * 1'
 
 permissions:
@@ -13,300 +13,69 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  # ─────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────
   # Job 1: Screenshot + git push (GitHub-hosted)
-  # ─────────────────────────────────────────────
+  # TODO: upload-haos, upload-fallback und notify wieder aktivieren
+  #       sobald der Screenshot korrekt funktioniert.
+  # ─────────────────────────────────────────────────────────────────
   screenshot:
     runs-on: ubuntu-latest
     env:
       CATERINGPORTAL_URL: "https://siemens.cateringportal.io/menu/Regensburg/Mittagessen"
-      # Optional: CATERINGPORTAL_SID als Secret hinterlegen falls Session-ID rotiert
       CATERINGPORTAL_SID: ${{ secrets.CATERINGPORTAL_SID }}
-    outputs:
-      screenshot_outcome: ${{ steps.screenshot.outcome }}
-      github_push_outcome: ${{ steps.github_push.outcome }}
-      week_filename: ${{ steps.set_filename.outputs.week_filename }}
-      old_files: ${{ steps.find_old.outputs.old_files }}
-      commit_sha: ${{ steps.github_push.outputs.commit_sha }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
           sudo apt-get update -q
-          sudo apt-get install -yq chromium-browser fonts-dejavu ncftp curl lftp
+          sudo apt-get install -yq chromium-browser fonts-dejavu curl
           pip install playwright Pillow
           python -m playwright install chromium
           python -m playwright install-deps chromium
 
       - name: Take screenshot
         id: screenshot
-        continue-on-error: true
         run: python scripts/take_screenshot.py
 
       - name: Generate RSS feed
-        id: rss
-        continue-on-error: true
-        run: python scripts/generate_rss.py
-
-      - name: Set week filename output
-        id: set_filename
         if: steps.screenshot.outcome == 'success'
-        run: |
-          LATEST=$(ls -t docs/images/kantine_*.jpg 2>/dev/null | head -1)
-          FNAME=$(basename "$LATEST")
-          echo "week_filename=${FNAME}" >> $GITHUB_OUTPUT
-          echo "Week filename: ${FNAME}"
+        run: python scripts/generate_rss.py
 
       - name: Update latest.jpg
         if: steps.screenshot.outcome == 'success'
-        continue-on-error: true
         run: |
           LATEST=$(ls -t docs/images/kantine_*.jpg | head -1)
           cp "$LATEST" docs/images/latest.jpg
-
-      - name: Update README screenshot link
-        if: steps.screenshot.outcome == 'success'
-        continue-on-error: true
-        run: |
-          FNAME="${{ steps.set_filename.outputs.week_filename }}"
-          if [[ -n "${FNAME}" ]]; then
-            sed -i "s|docs/images/kantine_[0-9][0-9][0-9][0-9]-W[0-9][0-9]\.jpg|docs/images/${FNAME}|g" README.md
-            sed -i "s|docs/images/latest\.jpg|docs/images/${FNAME}|g" README.md
-            echo "README updated: screenshot link -> docs/images/${FNAME}"
-          fi
-
-      - name: Delete images older than 8 weeks (GitHub)
-        id: find_old
-        continue-on-error: true
-        run: |
-          CUTOFF=$(date -u -d "56 days ago" +%Y-W%V)
-          OLD_LIST=""
-          for f in docs/images/kantine_*.jpg; do
-            FWEEK=$(basename "$f" | sed 's/kantine_//; s/\.jpg//')
-            if [[ "$FWEEK" < "$CUTOFF" ]]; then
-              echo "Deleting old file: $f (week: $FWEEK)"
-              git rm -f "$f" || true
-              OLD_LIST="${OLD_LIST}$(basename $f) "
-            fi
-          done
-          OLD_LIST=$(echo "$OLD_LIST" | xargs)
-          echo "old_files=${OLD_LIST}" >> $GITHUB_OUTPUT
+          echo "latest.jpg updated from: $LATEST"
 
       - name: Commit and push to GitHub
-        id: github_push
-        continue-on-error: true
+        if: steps.screenshot.outcome == 'success'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/ README.md
+          git add docs/
           git diff --cached --quiet || git commit -m "chore: weekly kantine screenshot update $(date -u +%Y-%m-%d)"
           git pull --rebase origin main
           git push
-          echo "commit_sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
 
-  # ─────────────────────────────────────────────────────────────────
-  # Job 2: FTP Upload via self-hosted HAOS runner (primary)
-  # ─────────────────────────────────────────────────────────────────
-  upload-haos:
-    runs-on: [self-hosted, haos]
-    needs: screenshot
-    continue-on-error: true
-    env:
-      BPLACED_PASS: ${{ secrets.BPLACED_FTP_PASSWORD }}
-      WEEK_FILE: ${{ needs.screenshot.outputs.week_filename }}
-      OLD_FILES: ${{ needs.screenshot.outputs.old_files }}
-      COMMIT_SHA: ${{ needs.screenshot.outputs.commit_sha }}
-    outputs:
-      upload_outcome: ${{ job.status }}
-    steps:
-      - uses: actions/checkout@v4
+      # Debug: Screenshot als Artifact herunterladen (10 Tage verfügbar)
+      # Actions → Run → Artifacts → "kantine-screenshot-debug"
+      - name: Upload screenshot as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          ref: ${{ needs.screenshot.outputs.commit_sha }}
-          fetch-depth: 1
-
-      - name: Install ncftp on runner
-        run: |
-          which ncftpput || (apt-get update -q && apt-get install -yq ncftp)
-
-      - name: Deploy to bplaced via ncftpput (HAOS self-hosted)
-        run: |
-          FTP_HOST="basecore.bplaced.net"
-          FTP_USER="basecore"
-          MAX_RETRIES=5
-          RETRY_DELAY=30
-          CMD_TIMEOUT=90
-          attempt=1
-
-          if [[ -n "${WEEK_FILE}" && -f "docs/images/${WEEK_FILE}" ]]; then
-            IMG_SRC="docs/images/${WEEK_FILE}"
-          else
-            IMG_SRC="docs/images/latest.jpg"
-          fi
-
-          while [ $attempt -le $MAX_RETRIES ]; do
-            if timeout $CMD_TIMEOUT ncftpput -u "$FTP_USER" -p "$BPLACED_PASS" -P 21 "$FTP_HOST" /www/ docs/feed.php && \
-               timeout $CMD_TIMEOUT ncftpput -u "$FTP_USER" -p "$BPLACED_PASS" -P 21 "$FTP_HOST" /www/images/ "${IMG_SRC}"; then
-              echo "Upload success."
-              break
-            fi
-            sleep $RETRY_DELAY
-            attempt=$((attempt + 1))
-          done
-
-          if [[ -n "${OLD_FILES}" ]]; then
-            for fname in ${OLD_FILES}; do
-              ncftp -u "$FTP_USER" -p "$BPLACED_PASS" "$FTP_HOST" << FTPCMD || true
-          delete /www/images/${fname}
-          quit
-          FTPCMD
-            done
-          fi
+          name: kantine-screenshot-debug
+          path: docs/images/
+          retention-days: 10
 
   # ─────────────────────────────────────────────────────────────────
-  # Job 3: FTP Upload via GitHub Actions (fallback)
+  # TODO: Folgende Jobs wieder einkommentieren sobald Screenshot läuft
+  #
+  # upload-haos:
+  #   ...
+  # upload-fallback:
+  #   ...
+  # notify:
+  #   ...
   # ─────────────────────────────────────────────────────────────────
-  upload-fallback:
-    runs-on: ubuntu-latest
-    needs: [screenshot, upload-haos]
-    if: always() && needs.upload-haos.result != 'success'
-    continue-on-error: true
-    env:
-      BPLACED_PASS: ${{ secrets.BPLACED_FTP_PASSWORD }}
-      WEEK_FILE: ${{ needs.screenshot.outputs.week_filename }}
-      OLD_FILES: ${{ needs.screenshot.outputs.old_files }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.screenshot.outputs.commit_sha }}
-          fetch-depth: 1
-
-      - name: Install FTP tools
-        run: sudo apt-get update -q && sudo apt-get install -yq lftp ncftp
-
-      - name: Deploy to bplaced via lftp (fallback)
-        run: |
-          FTP_HOST="basecore.bplaced.net"
-          FTP_USER="basecore"
-          MAX_RETRIES=6
-          RETRY_DELAY=60
-          CMD_TIMEOUT=90
-
-          if [[ -n "${WEEK_FILE}" && -f "docs/images/${WEEK_FILE}" ]]; then
-            IMG_SRC="docs/images/${WEEK_FILE}"
-            IMG_DEST=$(basename "${IMG_SRC}")
-          else
-            IMG_SRC="docs/images/latest.jpg"
-            IMG_DEST="latest.jpg"
-          fi
-
-          DELETE_CMDS=""
-          if [[ -n "${OLD_FILES}" ]]; then
-            for fname in ${OLD_FILES}; do
-              DELETE_CMDS="${DELETE_CMDS} rm -f /www/images/${fname};"
-            done
-          fi
-
-          attempt=1
-          while [ $attempt -le $MAX_RETRIES ]; do
-            if timeout $CMD_TIMEOUT lftp \
-              -u "$FTP_USER","$BPLACED_PASS" \
-              -e "set ftp:ssl-allow false; set net:timeout 20; set net:max-retries 1; set ftp:passive-mode true; cd /www; put docs/feed.php feed.php; cd /www/images; put ${IMG_SRC} ${IMG_DEST};${DELETE_CMDS} bye" \
-              ftp://$FTP_HOST; then
-              echo "lftp success."
-              break
-            fi
-            sleep $RETRY_DELAY
-            attempt=$((attempt + 1))
-          done
-
-  # ─────────────────────────────────────────────
-  # Job 4: Status E-Mail
-  # ─────────────────────────────────────────────
-  notify:
-    runs-on: ubuntu-latest
-    needs: [screenshot, upload-haos, upload-fallback]
-    if: always()
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build status email
-        run: |
-          RUN_TIME=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
-          REPO_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          WEEK_FILE="${{ needs.screenshot.outputs.week_filename }}"
-
-          SS="${{ needs.screenshot.outputs.screenshot_outcome }}"
-          GH="${{ needs.screenshot.outputs.github_push_outcome }}"
-          UH="${{ needs.upload-haos.result }}"
-          UF="${{ needs.upload-fallback.result }}"
-
-          status_icon() {
-            case "$1" in
-              success) echo "✅ OK" ;;
-              failure) echo "❌ FAILED" ;;
-              skipped) echo "⏭ SKIPPED" ;;
-              *)       echo "❓ UNKNOWN" ;;
-            esac
-          }
-
-          SS_I=$(status_icon "$SS")
-          GH_I=$(status_icon "$GH")
-          UH_I=$(status_icon "$UH")
-          UF_I=$(status_icon "$UF")
-
-          if [[ "$SS" == "success" && "$GH" == "success" && ( "$UH" == "success" || "$UF" == "success" ) ]]; then
-            SUBJ="✅ OK: Kantine PhotoFrame weekly run ($RUN_TIME)"
-            HC="#003366"
-            OV="All tasks successful"
-          else
-            SUBJ="❌ FAILED: Kantine PhotoFrame weekly run ($RUN_TIME)"
-            HC="#b71c1c"
-            OV="One or more tasks failed"
-          fi
-
-          SCREENSHOT_SECTION=""
-          if [[ "$SS" == "success" && -n "${WEEK_FILE}" ]]; then
-            IMG_URL="http://basecore.bplaced.net/images/${WEEK_FILE}"
-            SCREENSHOT_SECTION="<div style=\"margin-top:24px;\"><h3>📸 Aktueller Speiseplan (${WEEK_FILE})</h3><img src=\"${IMG_URL}\" style=\"max-width:100%;border:1px solid #ddd;border-radius:4px;\"/></div>"
-          fi
-
-          cat > email_body.html << MAILEOF
-          <!DOCTYPE html><html lang="de"><head><meta charset="UTF-8"></head>
-          <body style="font-family:Arial,sans-serif;max-width:700px;margin:0 auto;padding:20px;color:#333;">
-            <div style="background:${HC};color:#fff;padding:16px 20px;border-radius:6px 6px 0 0;">
-              <h2 style="margin:0;">Siemens Kantine Regensburg – Weekly Status</h2>
-            </div>
-            <div style="border:1px solid #ddd;padding:20px;">
-              <p><strong>Zeit:</strong> ${RUN_TIME}</p>
-              <p><strong>Status:</strong> ${OV}</p>
-              <table style="width:100%;border-collapse:collapse;font-size:14px;">
-                <tr style="background:#f5f5f5;">
-                  <th style="text-align:left;padding:8px;border:1px solid #ddd;">Task</th>
-                  <th style="text-align:left;padding:8px;border:1px solid #ddd;">Status</th>
-                </tr>
-                <tr><td style="padding:8px;border:1px solid #ddd;">Screenshot</td><td style="padding:8px;border:1px solid #ddd;">${SS_I}</td></tr>
-                <tr><td style="padding:8px;border:1px solid #ddd;">GitHub push</td><td style="padding:8px;border:1px solid #ddd;">${GH_I}</td></tr>
-                <tr><td style="padding:8px;border:1px solid #ddd;">FTP Upload HAOS (primary)</td><td style="padding:8px;border:1px solid #ddd;">${UH_I}</td></tr>
-                <tr><td style="padding:8px;border:1px solid #ddd;">FTP Upload GitHub (fallback)</td><td style="padding:8px;border:1px solid #ddd;">${UF_I}</td></tr>
-              </table>
-              ${SCREENSHOT_SECTION}
-              <p style="font-size:13px;margin-top:20px;"><a href="${REPO_URL}">🔗 GitHub Actions Log</a></p>
-            </div></body></html>
-          MAILEOF
-
-          echo "EMAIL_SUBJECT=${SUBJ}" >> $GITHUB_ENV
-
-      - name: Send status email
-        uses: basecore/action-send-mail@master
-        with:
-          server_address: smtp.gmail.com
-          server_port: 587
-          username: ${{ secrets.MAIL_USERNAME }}
-          password: ${{ secrets.MAIL_PASSWORD }}
-          subject: ${{ env.EMAIL_SUBJECT }}
-          body: file://email_body.html
-          to: basecore@gmx.de
-          from: Kantine PhotoFrame <${{ secrets.MAIL_USERNAME }}>
-          content_type: text/html
-          attachments: docs/images/latest.jpg
