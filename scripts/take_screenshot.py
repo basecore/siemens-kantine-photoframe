@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Siemens Kantine Regensburg – 800x600 JPEG.
 
-Actual page format (observed from flat text):
-  - Category labels: 'Soup / Starter', 'Food 1', 'Food 2', 'Food 3'
-    (English UI) or 'Suppe / Vorspeise', 'Essen 1' etc. (German UI)
-  - Both EN and DE are handled identically by CAT_HEADERS.
-  - Dish name spans multiple lines, then allergen codes (A, G, DAG …)
-  - Price token: 'Int  €3.20' or 'Int  3,20 €' – all on one line.
-  - Only today + future days visible; past days shown as grey.
+Portal behaviour (observed):
+  - /date/YYYY-MM-DD loads the page but the visible mat-tab-body
+    does NOT automatically switch to that day – Angular keeps whatever
+    tab was last active.
+  - The correct day tab must be CLICKED by matching its label text
+    (e.g. "25.06", "Thu.25.06.", "Do.25.06.").
+  - After clicking we wait until the panel text changes before extracting.
+  - Language: portal ignores Accept-Language and localStorage; stays EN.
+    Both EN and DE labels are handled by CAT_HEADERS.
 """
 import os, re
 from pathlib import Path
@@ -120,66 +122,6 @@ def day_key(dt_obj):
     short = ['Mo','Di','Mi','Do','Fr']
     return f"{short[dt_obj.weekday()]} {dt_obj.strftime('%d.%m')}"
 
-# ── Force German UI ──────────────────────────────────────────────────────────────
-def setup_german_language(page, base_url: str):
-    """
-    Visit the page once and write language preference to localStorage + cookie
-    so Angular renders in German for all subsequent navigations.
-    Cateringportal uses the key 'language' in localStorage (value 'de') and
-    sometimes a cookie named 'locale' or 'lang'.
-    """
-    from urllib.parse import urlparse
-    domain = urlparse(base_url).hostname
-
-    # Load the base URL (needed to set storage on the right origin)
-    try:
-        page.goto(base_url, wait_until="domcontentloaded", timeout=30000)
-    except Exception as e:
-        print(f"    setup_german: goto failed ({e}), continuing anyway")
-
-    # Inject language keys into localStorage
-    page.evaluate("""
-      () => {
-        try {
-          localStorage.setItem('language', 'de');
-          localStorage.setItem('locale',   'de');
-          localStorage.setItem('lang',     'de');
-          localStorage.setItem('i18n',     'de');
-          localStorage.setItem('selectedLanguage', 'de');
-          localStorage.setItem('appLanguage',      'de');
-        } catch(e) {}
-      }
-    """)
-
-    # Also set cookies
-    import time
-    expiry = int(time.time()) + 60 * 60 * 24 * 365
-    for name in ('language', 'locale', 'lang'):
-        try:
-            page.context.add_cookies([{
-                'name':    name,
-                'value':   'de',
-                'domain':  domain,
-                'path':    '/',
-                'expires': expiry,
-            }])
-        except Exception:
-            pass
-
-    # Try clicking a 'Deutsch' / 'DE' language button if present
-    for sel in ["text=Deutsch", "text=DE", "[aria-label='Deutsch']",
-                "button:has-text('DE')", "a:has-text('Deutsch')"]:
-        try:
-            page.click(sel, timeout=2000)
-            page.wait_for_timeout(600)
-            print(f"    setup_german: clicked '{sel}'")
-            break
-        except Exception:
-            pass
-
-    print(f"    setup_german: localStorage + cookies set for {domain}")
-
-
 # ── Parse flat innerText ──────────────────────────────────────────────────────
 CAT_HEADERS = {
     'Soup / Starter':    'Suppe',
@@ -197,7 +139,8 @@ CAT_HEADERS = {
     'Gericht 1':'Essen 1',
     'Gericht 2':'Essen 2',
     'Gericht 3':'Essen 3',
-    'Fisch':    'Essen 3',
+    'Fish':     'Essen 3',   # EN
+    'Fisch':    'Essen 3',   # DE
 }
 
 INT_PRICE_RE = re.compile(
@@ -223,7 +166,6 @@ NOISE = {
 }
 
 def parse_flat(lines: list) -> list:
-    """Parse flat innerText lines → [{kategorie, name, preis_int, vv}]."""
     dishes    = []
     cur_cat   = None
     cur_name  = []
@@ -287,7 +229,7 @@ def parse_flat(lines: list) -> list:
     return dishes
 
 
-# ── JS: get innerText of active mat-tab-body ─────────────────────────────────
+# ── JS helpers ─────────────────────────────────────────────────────────────────
 JS_TAB_TEXT = r"""
 (function(){
   var panels = Array.from(document.querySelectorAll(
@@ -305,48 +247,92 @@ JS_TAB_TEXT = r"""
 })()
 """
 
+# Click the tab whose label contains `date_str` (e.g. "25.06")
+# Returns the text of the tab that was clicked, or null.
+JS_CLICK_TAB = r"""
+(function(dateStr){
+  var tabs = Array.from(document.querySelectorAll(
+    '[role="tab"], mat-tab-header .mdc-tab, mat-tab-header .mat-tab-label,'
+    + '.mat-mdc-tab, .mat-tab-label-content'
+  ));
+  // also try ancestors that contain the date
+  var all = Array.from(document.querySelectorAll('*')).filter(el => {
+    if (!['BUTTON','A','DIV','SPAN','LI'].includes(el.tagName)) return false;
+    var t = (el.innerText || el.textContent || '').trim();
+    return t.includes(dateStr) && t.length < 30;
+  });
+  var candidates = tabs.concat(all);
+  var target = candidates.find(el => {
+    var t = (el.innerText || el.textContent || '').trim();
+    return t.includes(dateStr);
+  });
+  if (target) {
+    target.click();
+    return (target.innerText || target.textContent || '').trim();
+  }
+  return null;
+})
+"""
+
+
+def get_tab_text(page) -> list:
+    raw = page.evaluate(JS_TAB_TEXT) or ""
+    return [l.strip() for l in raw.splitlines() if l.strip()]
+
+
 # ── Scrape one day ────────────────────────────────────────────────────────────
 def scrape_day(page, date_obj) -> list:
     url = f"{URL_BASE}/date/{date_obj.strftime('%Y-%m-%d')}"
     if _SID: url += f"?ste_sid={_SID}"
-    print(f"  Loading {url}")
+    date_label = date_obj.strftime('%d.%m')   # e.g. "25.06"
+    print(f"  Loading {url}  [{date_label}]")
 
     page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-    found = False
+    # Wait for category headers to appear
+    found_sel = None
     for sel in [
         "text=Soup / Starter", "text=Food 1", "text=Food 2",
         "text=Suppe / Vorspeise", "text=Essen 1", "text=Suppe",
     ]:
         try:
             page.wait_for_selector(sel, timeout=10000)
-            found = True
-            print(f"    selector ok: {sel!r}")
+            found_sel = sel
             break
         except Exception:
             pass
-    if not found:
-        print("    no selector, extra wait 6s")
+    if not found_sel:
+        print("    no selector found, waiting 6s")
         page.wait_for_timeout(6000)
     else:
+        page.wait_for_timeout(500)
+
+    # --- Read text BEFORE clicking to detect change ---
+    text_before = get_tab_text(page)
+    before_sig  = ' '.join(text_before[:6])   # first few lines as signature
+
+    # --- Click the correct day tab ---
+    clicked = page.evaluate(f"({JS_CLICK_TAB})('{date_label}')")
+    print(f"    tab click result: {clicked!r}")
+
+    if clicked:
+        # Wait for Angular to re-render: poll until text changes or 3s pass
+        for _ in range(15):
+            page.wait_for_timeout(200)
+            new_lines = get_tab_text(page)
+            new_sig   = ' '.join(new_lines[:6])
+            if new_sig != before_sig:
+                print(f"    content changed after tab click")
+                break
+        else:
+            print(f"    content did NOT change after tab click (same day already active?)")
+    else:
+        print(f"    no tab found for {date_label} – using current content")
         page.wait_for_timeout(800)
 
-    raw_text = page.evaluate(JS_TAB_TEXT) or ""
-    lines    = [l.strip() for l in raw_text.splitlines() if l.strip()]
+    lines = get_tab_text(page)
     print(f"    tab lines: {len(lines)}")
-
-    if len(lines) < 5:
-        full = page.evaluate(r"""
-          (function(){
-            var b=document.body.cloneNode(true);
-            b.querySelectorAll('script,style,noscript').forEach(e=>e.remove());
-            return b.innerText||b.textContent||'';
-          })()
-        """) or ""
-        lines = [l.strip() for l in full.splitlines() if l.strip()]
-        print(f"    fallback full-page lines: {len(lines)}")
-
-    for i,l in enumerate(lines[:25]):
+    for i, l in enumerate(lines[:25]):
         print(f"      {i:2d}: {l[:110]}")
 
     dishes = parse_flat(lines)
@@ -515,9 +501,6 @@ def main():
             viewport={"width":1400,"height":900},
             extra_http_headers={"Accept-Language":"de-DE,de;q=0.9,en;q=0.1"},
         )
-        print("Setting up German UI language...")
-        setup_german_language(page, URL_BASE)
-
         for date_obj in scrape_dates:
             dk     = day_key(date_obj)
             dishes = scrape_day(page, date_obj)
