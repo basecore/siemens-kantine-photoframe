@@ -4,9 +4,9 @@
 Actual page format (observed from flat text):
   - Category labels: 'Soup / Starter', 'Food 1', 'Food 2', 'Food 3'
     (English UI) or 'Suppe / Vorspeise', 'Essen 1' etc. (German UI)
+  - Both EN and DE are handled identically by CAT_HEADERS.
   - Dish name spans multiple lines, then allergen codes (A, G, DAG …)
-  - Price line: 'Int  €3.20' or 'Int  3,20 €' or 'Int\xa00,60\xa0€'
-    i.e. "Int" and the price ARE on the same line (merged token).
+  - Price token: 'Int  €3.20' or 'Int  3,20 €' – all on one line.
   - Only today + future days visible; past days shown as grey.
 """
 import os, re
@@ -120,8 +120,67 @@ def day_key(dt_obj):
     short = ['Mo','Di','Mi','Do','Fr']
     return f"{short[dt_obj.weekday()]} {dt_obj.strftime('%d.%m')}"
 
+# ── Force German UI ──────────────────────────────────────────────────────────────
+def setup_german_language(page, base_url: str):
+    """
+    Visit the page once and write language preference to localStorage + cookie
+    so Angular renders in German for all subsequent navigations.
+    Cateringportal uses the key 'language' in localStorage (value 'de') and
+    sometimes a cookie named 'locale' or 'lang'.
+    """
+    from urllib.parse import urlparse
+    domain = urlparse(base_url).hostname
+
+    # Load the base URL (needed to set storage on the right origin)
+    try:
+        page.goto(base_url, wait_until="domcontentloaded", timeout=30000)
+    except Exception as e:
+        print(f"    setup_german: goto failed ({e}), continuing anyway")
+
+    # Inject language keys into localStorage
+    page.evaluate("""
+      () => {
+        try {
+          localStorage.setItem('language', 'de');
+          localStorage.setItem('locale',   'de');
+          localStorage.setItem('lang',     'de');
+          localStorage.setItem('i18n',     'de');
+          localStorage.setItem('selectedLanguage', 'de');
+          localStorage.setItem('appLanguage',      'de');
+        } catch(e) {}
+      }
+    """)
+
+    # Also set cookies
+    import time
+    expiry = int(time.time()) + 60 * 60 * 24 * 365
+    for name in ('language', 'locale', 'lang'):
+        try:
+            page.context.add_cookies([{
+                'name':    name,
+                'value':   'de',
+                'domain':  domain,
+                'path':    '/',
+                'expires': expiry,
+            }])
+        except Exception:
+            pass
+
+    # Try clicking a 'Deutsch' / 'DE' language button if present
+    for sel in ["text=Deutsch", "text=DE", "[aria-label='Deutsch']",
+                "button:has-text('DE')", "a:has-text('Deutsch')"]:
+        try:
+            page.click(sel, timeout=2000)
+            page.wait_for_timeout(600)
+            print(f"    setup_german: clicked '{sel}'")
+            break
+        except Exception:
+            pass
+
+    print(f"    setup_german: localStorage + cookies set for {domain}")
+
+
 # ── Parse flat innerText ──────────────────────────────────────────────────────
-# Category headers (EN + DE, all slash variants)
 CAT_HEADERS = {
     'Soup / Starter':    'Suppe',
     'Soup/Starter':      'Suppe',
@@ -141,7 +200,6 @@ CAT_HEADERS = {
     'Fisch':    'Essen 3',
 }
 
-# Matches: 'Int\xa0 €3.20', 'Int  3,20 €', 'Int\xa00,60\xa0€', 'Int   €6.10'
 INT_PRICE_RE = re.compile(
     r'Int[\s\u00a0]+[\u20ac$]?([0-9]+[.,][0-9]{2})'
     r'|Int[\s\u00a0]+([0-9]+[.,][0-9]{2})[\s\u00a0]*[\u20ac$]',
@@ -181,7 +239,6 @@ def parse_flat(lines: list) -> list:
             and not INT_PRICE_RE.search(t)
             and not EXT_RE.match(t)
         ]
-        # strip trailing allergen run
         while toks and ALLERGEN_RE.match(toks[-1]):
             toks.pop()
         name = ' '.join(toks).strip()
@@ -200,18 +257,13 @@ def parse_flat(lines: list) -> list:
         line = line.strip()
         if not line or line in NOISE:
             continue
-
-        # Category header?
         if line in CAT_HEADERS:
             flush()
             cur_cat  = CAT_HEADERS[line]
             cur_name = []
             continue
-
         if cur_cat is None:
             continue
-
-        # Int price line?
         m = INT_PRICE_RE.search(line)
         if m:
             raw = (m.group(1) or m.group(2) or '').replace(',','.')
@@ -221,29 +273,21 @@ def parse_flat(lines: list) -> list:
                 price_str = raw
             flush(price_str)
             continue
-
-        # "oder"/"or" → we already committed (or will commit) first dish;
-        # block second alternative by adding cat to seen_cats prematurely
         if OR_RE.match(line):
             seen_cats.add(cur_cat)
             cur_name = []
             continue
-
-        # Ext price line → skip
         if EXT_RE.match(line):
             continue
-
-        # Pure allergen token → skip
         if ALLERGEN_RE.match(line):
             continue
-
         cur_name.append(line)
 
     flush()
     return dishes
 
 
-# ── JS: get innerText of the active mat-tab-body ──────────────────────────────
+# ── JS: get innerText of active mat-tab-body ─────────────────────────────────
 JS_TAB_TEXT = r"""
 (function(){
   var panels = Array.from(document.querySelectorAll(
@@ -302,7 +346,6 @@ def scrape_day(page, date_obj) -> list:
         lines = [l.strip() for l in full.splitlines() if l.strip()]
         print(f"    fallback full-page lines: {len(lines)}")
 
-    # Debug: first 25 lines
     for i,l in enumerate(lines[:25]):
         print(f"      {i:2d}: {l[:110]}")
 
@@ -470,8 +513,11 @@ def main():
         browser = pw.chromium.launch()
         page = browser.new_page(
             viewport={"width":1400,"height":900},
-            extra_http_headers={"Accept-Language":"de-DE,de;q=0.9"},
+            extra_http_headers={"Accept-Language":"de-DE,de;q=0.9,en;q=0.1"},
         )
+        print("Setting up German UI language...")
+        setup_german_language(page, URL_BASE)
+
         for date_obj in scrape_dates:
             dk     = day_key(date_obj)
             dishes = scrape_day(page, date_obj)
