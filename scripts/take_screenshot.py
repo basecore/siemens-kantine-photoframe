@@ -2,10 +2,9 @@
 """Siemens Kantine Regensburg – 1200x800 JPEG.
 
 Portal behaviour:
-  - First visit shows a cookie consent banner – must be dismissed before
-    menu content is accessible.
-  - Language stays EN unless ?lang=de (or similar) is appended to the URL.
-    We try several known URL patterns; fall back to EN if none work.
+  - Cookie consent banner must be dismissed first.
+  - Language is switched by clicking the German flag button whose src
+    contains '/assets/icons/flags/de-DE.svg'.
   - /date/YYYY-MM-DD does NOT auto-switch the visible tab – must click it.
   - After tab click we poll until panel content changes (Angular re-render).
 """
@@ -120,85 +119,81 @@ def day_key(dt_obj):
     short = ['Mo','Di','Mi','Do','Fr']
     return f"{short[dt_obj.weekday()]} {dt_obj.strftime('%d.%m')}"
 
-# ── Cookie banner + language setup (called once before first scrape) ────────
-def warmup(page, base_url: str):
+# ── Cookie banner + German language setup ────────────────────────────────
+def dismiss_cookie_banner(page):
+    """Try all known cookie consent selectors. Silent if none found."""
+    for sel in [
+        "text=Got it!",
+        "button:has-text('Got it')",
+        "button:has-text('Accept')",
+        "button:has-text('Akzeptieren')",
+        "button:has-text('Alle akzeptieren')",
+        "[id*='accept' i]",
+        "[class*='accept' i] button",
+        "[id*='cookie' i] button",
+        "[class*='cookie' i] button",
+        "[id*='consent' i] button",
+    ]:
+        try:
+            page.click(sel, timeout=2000)
+            print(f"  [cookie] dismissed: {sel!r}")
+            page.wait_for_timeout(600)
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def switch_to_german(page):
     """
-    1. Load the base URL.
-    2. Accept cookie consent banner ("Got it!" / "Akzeptieren" etc.).
-    3. Try to switch to German UI via known mechanisms:
-       a. Reload with ?lang=de or ?locale=de appended
-       b. Click a visible DE/Deutsch button
-       c. Set localStorage keys (last resort)
-    Prints what worked so we can track it in the Actions log.
+    Click the German flag button. The portal uses img src
+    '/assets/icons/flags/de-DE.svg' as the language switcher.
+    After clicking, wait for a German-language selector to confirm.
     """
+    FLAG_SEL = "img[src*='de-DE']"
+    # The img may be inside a button or anchor – try the image itself
+    # and also its parent button/a.
+    JS_CLICK_FLAG = r"""
+    (function(){
+      var img = document.querySelector("img[src*='de-DE']");
+      if (!img) return 'not found';
+      var btn = img.closest('button,a') || img;
+      btn.click();
+      return btn.tagName + ' clicked: ' + (img.getAttribute('src') || '');
+    })()
+    """
+    try:
+        # Wait for the flag image to appear in the DOM
+        page.wait_for_selector(FLAG_SEL, timeout=8000)
+        result = page.evaluate(JS_CLICK_FLAG)
+        print(f"  [lang] flag click: {result}")
+        # Wait for Angular to re-render in German
+        for de_sel in ["text=Suppe", "text=Suppe / Vorspeise", "text=Essen 1",
+                       "text=Do.", "text=Fr.", "text=Mo."]:
+            try:
+                page.wait_for_selector(de_sel, timeout=4000)
+                print(f"  [lang] German confirmed: {de_sel!r}")
+                return True
+            except Exception:
+                pass
+        print("  [lang] flag clicked but German selector not confirmed")
+        return False
+    except Exception as e:
+        print(f"  [lang] flag button not found: {e}")
+        return False
+
+
+def warmup(page, base_url):
+    """Load the base URL, dismiss cookie banner, switch to German."""
     print("  [warmup] loading base URL...")
     try:
         page.goto(base_url, wait_until="domcontentloaded", timeout=40000)
     except Exception as e:
         print(f"  [warmup] goto failed: {e}")
         return
-
-    # ── Accept cookie banner ────────────────────────────────────────
-    COOKIE_SELS = [
-        "text=Got it!",
-        "text=Akzeptieren",
-        "text=Accept",
-        "text=Accept all",
-        "text=Alle akzeptieren",
-        "button:has-text('Got it')",
-        "button:has-text('Accept')",
-        "button:has-text('Akzeptieren')",
-        "[id*='accept']",
-        "[class*='accept']",
-        "[id*='cookie'] button",
-        "[class*='cookie'] button",
-        "[id*='consent'] button",
-        "[aria-label*='cookie' i]",
-    ]
-    for sel in COOKIE_SELS:
-        try:
-            page.click(sel, timeout=2500)
-            print(f"  [warmup] cookie banner dismissed: {sel!r}")
-            page.wait_for_timeout(800)
-            break
-        except Exception:
-            pass
-
-    # ── Try German via URL query param ──────────────────────────────
-    for param in ['?lang=de', '?locale=de', '?language=de', '?culture=de']:
-        try:
-            url_de = base_url.rstrip('/') + '/date/' + param if '?' not in base_url else base_url + '&lang=de'
-            # simpler: just append to the base URL itself
-            url_de = base_url.split('?')[0] + param
-            page.goto(url_de, wait_until="domcontentloaded", timeout=20000)
-            # Check if menu content appeared in German
-            for de_sel in ["text=Suppe", "text=Essen 1", "text=Suppe / Vorspeise"]:
-                try:
-                    page.wait_for_selector(de_sel, timeout=4000)
-                    print(f"  [warmup] German UI confirmed via {param} + {de_sel!r}")
-                    return   # success
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    # ── Try clicking a DE / Deutsch button ───────────────────────────
-    for sel in ["text=DE", "text=Deutsch", "[aria-label='Deutsch']",
-                "button:has-text('DE')", "a:has-text('DE')"]:
-        try:
-            page.click(sel, timeout=2000)
-            page.wait_for_timeout(800)
-            print(f"  [warmup] language button clicked: {sel!r}")
-            return
-        except Exception:
-            pass
-
-    # ── localStorage fallback ──────────────────────────────────────
-    page.evaluate("""
-      () => ['language','locale','lang','i18n','selectedLanguage','appLanguage']
-             .forEach(k => { try { localStorage.setItem(k,'de'); } catch(e){} });
-    """)
-    print("  [warmup] localStorage keys set to 'de' (fallback)")
+    page.wait_for_timeout(1500)   # let Angular bootstrap
+    dismiss_cookie_banner(page)
+    switch_to_german(page)
 
 
 # ── Parser ────────────────────────────────────────────────────────────────────
@@ -222,8 +217,6 @@ CAT_HEADERS = {
     'Fisch':    'Essen 3',
 }
 
-# Exact whole-line labels that open a new vegan/veg sub-slot.
-# "Vegane Linsensuppe" is NOT here – it becomes a name token, no slot change.
 VEGAN_LABELS = {
     'Vegan':        'VG',
     'Vegetarian':   'V',
@@ -343,28 +336,20 @@ def get_tab_text(page):
 def scrape_day(page, date_obj):
     url = f"{URL_BASE}/date/{date_obj.strftime('%Y-%m-%d')}"
     if _SID: url += f"?ste_sid={_SID}"
-    date_label = date_obj.strftime('%d.%m')   # e.g. "25.06"
+    date_label = date_obj.strftime('%d.%m')
     print(f"  Loading {url}  [{date_label}]")
 
     page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(800)
 
-    # Dismiss cookie banner if it re-appears on this navigation
-    for sel in ["text=Got it!", "button:has-text('Got it')",
-                "button:has-text('Accept')", "button:has-text('Akzeptieren')",
-                "[id*='cookie'] button", "[class*='cookie'] button"]:
-        try:
-            page.click(sel, timeout=1500)
-            print(f"    cookie banner dismissed: {sel!r}")
-            page.wait_for_timeout(500)
-            break
-        except Exception:
-            pass
+    # Dismiss cookie banner in case it re-appears
+    dismiss_cookie_banner(page)
 
-    # Wait for category header to appear
+    # Wait for any category header
     found_sel = None
     for sel in [
+        "text=Suppe / Vorspeise", "text=Suppe", "text=Essen 1",
         "text=Soup / Starter", "text=Food 1",
-        "text=Suppe / Vorspeise", "text=Essen 1", "text=Suppe",
     ]:
         try:
             page.wait_for_selector(sel, timeout=12000)
@@ -373,10 +358,10 @@ def scrape_day(page, date_obj):
         except Exception:
             pass
     if not found_sel:
-        print("    no menu selector found, extra wait 6s")
-        page.wait_for_timeout(6000)
+        print("    no menu selector found, extra wait 5s")
+        page.wait_for_timeout(5000)
     else:
-        page.wait_for_timeout(600)
+        page.wait_for_timeout(400)
 
     # Click the correct day tab and wait for Angular re-render
     before_sig = ' '.join(get_tab_text(page)[:6])
@@ -390,9 +375,9 @@ def scrape_day(page, date_obj):
                 print("    content changed")
                 break
         else:
-            print("    content unchanged (same tab active?)")
+            print("    content unchanged (same tab?)")
     else:
-        print(f"    no tab found for {date_label}, using current content")
+        print(f"    no tab for {date_label}, using current content")
         page.wait_for_timeout(600)
 
     lines = get_tab_text(page)
@@ -569,7 +554,7 @@ def main():
             viewport={"width":1400,"height":900},
             extra_http_headers={"Accept-Language":"de-DE,de;q=0.9,en;q=0.1"},
         )
-        warmup(page, URL_BASE)   # cookie banner + language
+        warmup(page, URL_BASE)   # cookie banner + German flag button
         for date_obj in scrape_dates:
             dk=day_key(date_obj)
             dishes=scrape_day(page,date_obj)
