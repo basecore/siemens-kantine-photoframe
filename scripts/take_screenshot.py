@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """Siemens Kantine Regensburg – weekly menu PDF scraper + 800x600 JPEG renderer.
 
+The qnips PDF has a column layout:
+  - All 5 soups listed consecutively (Mon-Fri)
+  - Then all 5 Essen-1 dishes (Mon-Fri)
+  - Then all 5 Essen-2 dishes (Mon-Fri)
+  - Then all 5 Essen-3 dishes (Mon-Fri)
+  - Text is extracted as one long string with items separated by price pairs
+
 Approach:
-  1. Load cateringportal.io with Playwright – find the qnips PDF link
-     (prefer files.qnips.com/release-menu-pdfs/Mittagessen*)
+  1. Load cateringportal.io with Playwright -> find qnips PDF link
   2. Download the weekly PDF with requests
-  3. Parse menu text from PDF with pdfplumber
-  4. Render clean 800x600 LANDSCAPE JPEG with Pillow
-  5. Save to docs/images/kantine_YYYY-Www.jpg
+  3. Parse menu items from PDF text (dedup + price-pair splitting)
+  4. Assign items to days (5 per category = index 0-4 -> Mon-Fri)
+  5. Render clean 800x600 LANDSCAPE JPEG with Pillow
 """
 import os
 import re
@@ -41,7 +47,7 @@ OUT_DIR  = Path("docs/images")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 MAX_KEEP = 8
 
-# LANDSCAPE for Philips 8FF3WMI
+# LANDSCAPE 800x600 for Philips 8FF3WMI
 W, H = 800, 600
 
 # ── Colours ─────────────────────────────────────────────────────────────────
@@ -103,24 +109,19 @@ def kw_label(dt):
     y, w, _ = d.isocalendar()
     return f"{y}-W{w:02d}", int(w)
 
-# ── Step 1: Find PDF URL ─────────────────────────────────────────────────────────
+# ── Step 1: Find qnips PDF URL in page HTML ────────────────────────────────────
 def find_pdf_url(html: str, kw: int) -> str | None:
-    """
-    Search the page HTML for a qnips PDF link.
-    Only accept URLs from files.qnips.com that contain 'Mittagessen' in the filename.
-    """
-    # Strict: only qnips release-menu PDFs
+    # Strict: only Mittagessen PDFs from qnips
     strict = re.findall(
         r'(https://files\.qnips\.com/release-menu-pdfs/Mittagessen[^"\s\'<>]+\.pdf[^"\s\'<>]*)',
         html, re.I
     )
     if strict:
-        # prefer current KW
         for url in strict:
-            if f"_{kw}_" in url or f"_DE_{kw}_" in url:
+            if f"_DE_{kw}_" in url or f"_{kw}_" in url:
                 print(f"  PDF found (KW {kw} match): {url[:120]}")
                 return url
-        print(f"  PDF found (first qnips match): {strict[0][:120]}")
+        print(f"  PDF found (first Mittagessen match): {strict[0][:120]}")
         return strict[0]
 
     # Fallback: any qnips PDF
@@ -130,10 +131,10 @@ def find_pdf_url(html: str, kw: int) -> str | None:
     )
     for url in loose:
         if f"_{kw}_" in url:
-            print(f"  PDF found (qnips loose KW match): {url[:120]}")
+            print(f"  PDF found (qnips KW match): {url[:120]}")
             return url
     if loose:
-        print(f"  PDF found (qnips loose first): {loose[0][:120]}")
+        print(f"  PDF found (qnips first): {loose[0][:120]}")
         return loose[0]
 
     print("  No qnips PDF URL found in HTML.")
@@ -147,179 +148,151 @@ def download_pdf(url: str) -> bytes:
     print(f"  PDF downloaded: {len(r.content):,} bytes")
     return r.content
 
-# ── Step 3: Extract text from PDF ────────────────────────────────────────────────
+# ── Step 3: Extract raw text from PDF ─────────────────────────────────────────────
 def extract_pdf_text(pdf_bytes: bytes) -> str:
     if pdfplumber:
         try:
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                pages = []
-                for page in pdf.pages:
-                    # extract_text with layout preserves columns better
-                    t = page.extract_text(layout=True) or page.extract_text() or ""
-                    pages.append(t)
+                # join all pages, no layout mode (gives single long string per page)
+                pages = [p.extract_text() or "" for p in pdf.pages]
             text = "\n".join(pages)
             if text.strip():
-                print(f"  pdfplumber: {len(text)} chars extracted")
+                print(f"  pdfplumber: {len(text)} chars")
                 return text
         except Exception as e:
             print(f"  pdfplumber error: {e}")
     if PdfReader:
         reader = PdfReader(io.BytesIO(pdf_bytes))
-        pages = [p.extract_text() or "" for p in reader.pages]
-        text = "\n".join(pages)
-        print(f"  pypdf: {len(text)} chars extracted")
+        text = "\n".join(p.extract_text() or "" for p in reader.pages)
+        print(f"  pypdf: {len(text)} chars")
         return text
     raise RuntimeError("No PDF parser available")
 
-# ── Step 4: Parse menu from PDF text ─────────────────────────────────────────
-NORM = lambda s: re.sub(r"\s+", " ", s or "").strip()
+# ── Step 4: Parse qnips column layout ─────────────────────────────────────────────
+def dedup_text(text: str) -> str:
+    """Remove immediately repeated words/phrases that pdfplumber creates from dual columns."""
+    # e.g. "Rinderbrühe mitRinderbrühe mit" -> "Rinderbrühe mit"
+    for _ in range(6):
+        text = re.sub(r'([A-Za-z\u00c0-\u017e,\- ]{4,})\1', r'\1', text)
+    return text
 
-DAY_RE = re.compile(
-    r"^(montag|dienstag|mittwoch|donnerstag|freitag|"
-    r"mo\.?|di\.?|mi\.?|do\.?|fr\.?)(\s|,|\.|\d|$)",
-    re.I,
-)
-DAY_MAP = {
-    "mo": "Mo", "mon": "Mo", "montag": "Mo",
-    "di": "Di", "die": "Di", "dienstag": "Di",
-    "mi": "Mi", "mit": "Mi", "mittwoch": "Mi",
-    "do": "Do", "don": "Do", "donnerstag": "Do",
-    "fr": "Fr", "fre": "Fr", "freitag": "Fr",
-}
-CAT_RE = [
-    ("Suppe",   re.compile(r"^\s*(suppe|vorspeise|tagessuppe|cremesuppe)", re.I)),
-    ("Essen 1", re.compile(r"^\s*(essen\s*1|men.\s*1|gericht\s*1|men.\s*i\b|hauptgericht\s*1)", re.I)),
-    ("Essen 2", re.compile(r"^\s*(essen\s*2|men.\s*2|gericht\s*2|men.\s*ii\b|hauptgericht\s*2)", re.I)),
-    ("Essen 3", re.compile(r"^\s*(essen\s*3|men.\s*3|gericht\s*3|men.\s*iii\b|hauptgericht\s*3|vegetarisch|vegan)", re.I)),
-]
-PRICE_RE = re.compile(r"(\d+[,.]\d{2})\s*\u20ac?")
+def fix_name(name: str) -> str:
+    """Insert spaces before CamelCase transitions and clean up whitespace."""
+    # "CurrysoßeCurrysoße" already handled by dedup
+    # "TomatenspaghettiZitronenecke" -> "Tomatenspaghetti Zitronenecke"
+    name = re.sub(r'([a-z\u00e0-\u017e])([A-Z\u00c0-\u00d6\u00d8-\u00de])', r'\1 \2', name)
+    name = re.sub(r'\s+', ' ', name).strip()
+    return name
 
-def detect_day(line):
-    m = DAY_RE.match(line.strip())
-    if not m:
-        return None
-    key = m.group(1).lower().rstrip(".")
-    return DAY_MAP.get(key)
+def detect_vv(name: str) -> str:
+    low = name.lower()
+    if 'vegan' in low:
+        return 'VG'
+    if 'vegetar' in low:
+        return 'V'
+    return ''
 
-def detect_cat(line):
-    for cat, pat in CAT_RE:
-        if pat.search(line):
-            return cat
-    return None
+def split_items(body: str) -> list:
+    """
+    Split the PDF body text into individual dish items.
+    Each item ends with a price pair like "3,206,40" or "0,601,20".
+    Returns list of (name, int_price_str).
+    """
+    # Split at price pairs (intXX,XXextXX,XX merged together)
+    # Pattern: digits,digits directly followed by another digits,digits
+    # We split AFTER each price pair to get: name + price_pair | next_name...
+    parts = re.split(r'(?<=\d{2})  +(?=[A-Z\u00c0-\u00de])', body)
 
-def detect_vv(text):
-    t = text.lower()
-    if "vegan" in t:
-        return "VG"
-    if "vegetar" in t or re.search(r"\bveg\b", t):
-        return "V"
-    return ""
+    result = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        # Extract trailing price pair "3,206,40" or "0,601,20" (no space between int+ext)
+        m = re.search(r'(\d+,\d{2})(\d+,\d{2})\s*$', part)
+        if m:
+            name = part[:m.start()].strip()
+            price = m.group(1) + ' \u20ac'
+        else:
+            # Try with space between: "3,20 6,40"
+            m2 = re.search(r'(\d+,\d{2})\s+(\d+,\d{2})\s*$', part)
+            if m2:
+                name = part[:m2.start()].strip()
+                price = m2.group(1) + ' \u20ac'
+            else:
+                name = part
+                price = ''
 
-def extract_price(text):
-    m = PRICE_RE.search(text)
-    return (m.group(1).replace(".", ",") + " €") if m else ""
+        name = fix_name(name)
+        # skip noise
+        if not name or len(name) < 3:
+            continue
+        low = name.lower()
+        skip_words = ['oder', 'int', 'ext', 'int.ext', 'mo - fr', 'alle preise',
+                      'all prices', 'restaurant', 'thomas', '+49', 'allergen']
+        if any(low.startswith(w) for w in skip_words):
+            continue
+        # skip pure price / header lines
+        if re.match(r'^[\d.,\s\u20ac/]+$', name):
+            continue
 
-def is_noise(line):
-    """Skip lines that are clearly not menu content."""
-    low = line.lower()
-    noise_words = [
-        "allergen", "additiv", "zusatzstoff", "kennzeichn",
-        "zf ", "zk ", "za ", "zgv", "gluten",
-        "nuts", "peanut", "crustacean", "lupin", "mollusc",
-        "milk", "celery", "mustard", "sesame",
-        "calories", "kalorien", "kcal", "kj",
-        "siemens ag", "siemens gastronomie",
-        "montag bis freitag", "monday", "tuesday",
-        "printed", "gedruckt", "kantine regensburg",
-        "impressum", "datenschutz", "copyright",
-        "seite ", "page ",
-    ]
-    if any(w in low for w in noise_words):
-        return True
-    # pure number / price lines without letters
-    if re.match(r"^[\d.,\s\u20ac/]+$", line):
-        return True
-    # very short lines (1-2 chars)
-    if len(line.strip()) <= 2:
-        return True
-    return False
+        result.append((name, price))
 
-def parse_menu_from_text(text: str, local_dt: datetime) -> dict:
+    return result
+
+def parse_menu(pdf_text: str, local_dt: datetime) -> dict:
+    """
+    Parse the qnips PDF text into week_data dict.
+    Layout: items 0-4 = Suppe Mon-Fri, 5-9 = Essen1, 10-14 = Essen2, 15-19 = Essen3.
+    """
     monday = local_dt - timedelta(days=local_dt.weekday())
-    dates = {
-        "Mo": (monday + timedelta(days=0)).strftime("%d.%m"),
-        "Di": (monday + timedelta(days=1)).strftime("%d.%m"),
-        "Mi": (monday + timedelta(days=2)).strftime("%d.%m"),
-        "Do": (monday + timedelta(days=3)).strftime("%d.%m"),
-        "Fr": (monday + timedelta(days=4)).strftime("%d.%m"),
-    }
+    day_short = ['Mo', 'Di', 'Mi', 'Do', 'Fr']
+    days = [f"{day_short[i]} {(monday + timedelta(days=i)).strftime('%d.%m')}" for i in range(5)]
 
-    lines = [NORM(l) for l in text.splitlines() if NORM(l)]
+    # Clean and flatten text
+    text = ' '.join(pdf_text.split())
+    text = dedup_text(text)
 
-    week: dict = {}
-    cur_day  = None
-    cur_cat  = None
-    buf: list = []
+    # Strip header up to phone number or known markers
+    text = re.sub(
+        r'^.*?(?:Restaurant\s+Regensburg|\+49[^\s]+|\d{2}:\d{2}\s+Uhr)\s*',
+        '', text, flags=re.I
+    ).strip()
 
-    def flush():
-        nonlocal cur_cat, buf
-        if cur_day and cur_cat and buf:
-            txt = " ".join(buf).strip()
-            if len(txt) > 4:
-                label = f"{cur_day} {dates.get(cur_day, '')}"
-                week.setdefault(label, [])
-                if not any(e["kategorie"] == cur_cat for e in week[label]):
-                    week[label].append({
-                        "kategorie": cur_cat,
-                        "name":      txt,
-                        "vv":        detect_vv(txt),
-                        "preis_int": extract_price(txt),
-                    })
-        buf.clear()
-        cur_cat = None
+    # Now split into items
+    items = split_items(text)
 
-    for line in lines:
-        if is_noise(line):
-            continue
+    print(f"  Items extracted: {len(items)}")
+    for i, (n, p) in enumerate(items):
+        print(f"    {i:2d}: {n[:60]!r:65} {p}")
 
-        day = detect_day(line)
-        if day:
-            flush()
-            cur_day = day
-            cur_cat = None
-            continue
+    # Map to days: 5 items per category
+    CATS = ['Suppe', 'Essen 1', 'Essen 2', 'Essen 3']
+    week_data = {day: [] for day in days}
 
-        cat = detect_cat(line)
-        if cat:
-            flush()
-            cur_cat = cat
-            # strip category label from line, keep rest if meaningful
-            rest = re.sub(
-                r"(suppe|vorspeise|tagessuppe|cremesuppe"
-                r"|essen\s*\d+|men.\s*\d+|gericht\s*\d+"
-                r"|men.\s*i{1,3}\b|hauptgericht\s*\d+"
-                r"|vegetarisch|vegan)",
-                "", line, flags=re.I
-            ).strip(" :|-").strip()
-            buf = [rest] if len(rest) > 4 else []
-            continue
+    for ci, cat in enumerate(CATS):
+        start = ci * 5
+        cat_items = items[start:start + 5]
+        for di, day in enumerate(days):
+            if di < len(cat_items):
+                name, price = cat_items[di]
+                week_data[day].append({
+                    'kategorie': cat,
+                    'name':      name,
+                    'vv':        detect_vv(name),
+                    'preis_int': price,
+                })
 
-        if cur_cat and len(line) > 3:
-            buf.append(line)
+    # Remove empty days
+    week_data = {k: v for k, v in week_data.items() if v}
+    return week_data
 
-    flush()
-
-    for label in list(week.keys()):
-        week[label] = week[label][:4]
-
-    return week
-
-# ── Step 5: Render landscape JPEG 800x600 ─────────────────────────────────────────
+# ── Step 5: Render 800x600 landscape JPEG ─────────────────────────────────────────
 def wrap_text(draw, text, f, max_w):
     words = text.split()
-    out, cur = [], ""
+    out, cur = [], ''
     for w in words:
-        t = (cur + " " + w).strip()
+        t = (cur + ' ' + w).strip()
         b = draw.textbbox((0, 0), t, font=f)
         if b[2] - b[0] <= max_w:
             cur = t
@@ -331,10 +304,10 @@ def wrap_text(draw, text, f, max_w):
         out.append(cur)
     return out
 
-CATS = ["Suppe", "Essen 1", "Essen 2", "Essen 3"]
+CATS = ['Suppe', 'Essen 1', 'Essen 2', 'Essen 3']
 
 def render(week_data, kw, label, local_dt):
-    img  = Image.new("RGB", (W, H), (255, 255, 255))
+    img  = Image.new('RGB', (W, H), (255, 255, 255))
     d    = ImageDraw.Draw(img)
     ftit = lf(14, True)
     fday = lf(11, True)
@@ -344,27 +317,30 @@ def render(week_data, kw, label, local_dt):
     fprc = lf( 8, False)
     fftr = lf( 9, False)
 
-    # ── Header ──
-    HDR_H = 38
+    HDR_H    = 36
+    FOOTER_H = 22
+    LEGEND_H = 17
+
+    # Header
     d.rectangle([(0,0),(W,HDR_H)], fill=BLUE)
-    title = f"Siemens Kantine Regensburg  |  KW {kw:02d}"
+    title = f'Siemens Kantine Regensburg  |  KW {kw:02d}'
     b = d.textbbox((0,0), title, font=ftit)
     d.text(((W-(b[2]-b[0]))//2, (HDR_H-(b[3]-b[1]))//2), title, font=ftit, fill=WHITE)
     y = HDR_H
 
     if not week_data:
-        d.text((20, y+40), "Speiseplan konnte nicht geladen werden.", font=ftxt, fill=C_TXT)
-        d.text((20, y+60), "Bitte manuell prüfen:",                  font=ftxt, fill=C_TXT)
-        d.text((20, y+80), URL_MENU,                                  font=ftxt, fill=LIGHT)
+        d.text((20, y+40), 'Speiseplan konnte nicht geladen werden.', font=ftxt, fill=C_TXT)
+        d.text((20, y+60), 'Bitte manuell pr\u00fcfen:', font=ftxt, fill=C_TXT)
+        d.text((20, y+80), URL_MENU, font=ftxt, fill=LIGHT)
         _footer(d, kw, label, local_dt, fftr)
         return img
 
     days = list(week_data.keys())[:5]
     n    = len(days)
-    dw   = W // n                 # column width per day
+    dw   = W // n
 
-    # ── Day-header row ──
-    DAY_H = 22
+    # Day headers
+    DAY_H = 20
     for i, day in enumerate(days):
         x = i * dw
         d.rectangle([(x,y),(x+dw-1,y+DAY_H-1)], fill=LIGHT)
@@ -374,19 +350,15 @@ def render(week_data, kw, label, local_dt):
             d.line([(x,y),(x,y+DAY_H)], fill=BLUE, width=1)
     y += DAY_H
 
-    # Row heights to fill remaining space (H - header - day-row - footer)
-    FOOTER_H = 24
-    LEGEND_H = 18
-    available = H - y - FOOTER_H - LEGEND_H - 1
-    n_cats    = len(CATS)
-    # Suppe gets 60%, Essen rows split the rest equally
-    row_h_suppe  = int(available * 0.22)
-    row_h_essen  = (available - row_h_suppe) // (n_cats - 1)
+    # Distribute remaining height among rows
+    avail = H - y - FOOTER_H - LEGEND_H - 2
+    row_suppe  = int(avail * 0.20)
+    row_essen  = (avail - row_suppe) // 3
     ROW_H = {
-        "Suppe":   row_h_suppe,
-        "Essen 1": row_h_essen,
-        "Essen 2": row_h_essen,
-        "Essen 3": available - row_h_suppe - 2*row_h_essen,
+        'Suppe':   row_suppe,
+        'Essen 1': row_essen,
+        'Essen 2': row_essen,
+        'Essen 3': avail - row_suppe - 2*row_essen,
     }
 
     for ri, cat in enumerate(CATS):
@@ -399,40 +371,39 @@ def render(week_data, kw, label, local_dt):
             if i > 0:
                 d.line([(x,y),(x,y+rh)], fill=GRID, width=1)
 
-            items = [it for it in week_data.get(day,[]) if it["kategorie"]==cat]
+            items = [it for it in week_data.get(day,[]) if it['kategorie']==cat]
             if not items:
-                b = d.textbbox((0,0),"–",font=ftxt)
-                d.text((x+(dw-(b[2]-b[0]))//2, y+rh//2-6),"–",font=ftxt,fill=(180,180,180))
+                b = d.textbbox((0,0),'-',font=ftxt)
+                d.text((x+(dw-(b[2]-b[0]))//2, y+rh//2-6), '-', font=ftxt, fill=(180,180,180))
                 continue
 
-            it = items[0]
-            cx, cy = x+4, y+3
+            it  = items[0]
+            cx  = x + 4
+            cy  = y + 3
             avw = dw - 8
 
-            # category label
-            d.text((cx,cy), it["kategorie"], font=fcat, fill=(100,100,100))
-            cy += 11
+            d.text((cx,cy), it['kategorie'], font=fcat, fill=(100,100,100))
+            cy += 10
 
-            # badge
-            if it["vv"]:
-                bl = "Vegan" if it["vv"]=="VG" else "Veg."
-                bc = C_VG   if it["vv"]=="VG" else C_V
+            if it['vv']:
+                bl = 'Vegan' if it['vv']=='VG' else 'Veg.'
+                bc = C_VG   if it['vv']=='VG' else C_V
                 b  = d.textbbox((0,0),bl,font=fbdg)
-                bw = b[2]-b[0]+6; bh = b[3]-b[1]+3
+                bw = b[2]-b[0]+5; bh = b[3]-b[1]+3
                 d.rounded_rectangle([(cx,cy),(cx+bw,cy+bh)],radius=3,fill=bc)
                 d.text((cx+3,cy+1),bl,font=fbdg,fill=WHITE)
-                cy += bh+3
+                cy += bh + 2
 
-            max_lines = 2 if cat=="Suppe" else 3
-            for ln in wrap_text(d, it["name"], ftxt, avw)[:max_lines]:
+            max_lines = 2 if cat=='Suppe' else 3
+            for ln in wrap_text(d, it['name'], ftxt, avw)[:max_lines]:
                 d.text((cx,cy),ln,font=ftxt,fill=C_TXT)
-                cy += 12
+                cy += 11
 
-            if it["preis_int"]:
+            if it['preis_int']:
                 pl = f"Int: {it['preis_int']}"
                 b  = d.textbbox((0,0),pl,font=fprc)
-                d.text((x+dw-(b[2]-b[0])-4, y+rh-(b[3]-b[1])-3),
-                       pl,font=fprc,fill=LIGHT)
+                d.text((x+dw-(b[2]-b[0])-3, y+rh-(b[3]-b[1])-3),
+                       pl, font=fprc, fill=LIGHT)
         y += rh
 
     d.line([(0,y),(W,y)], fill=GRID, width=1)
@@ -440,83 +411,77 @@ def render(week_data, kw, label, local_dt):
 
     # Legend
     d.rectangle([(0,y),(W,y+LEGEND_H)], fill=(245,249,253))
-    d.rectangle([( 6,y+4),(18,y+14)], fill=C_VG)
-    d.text((22,y+4), "Vegan",          font=fprc, fill=C_TXT)
-    d.rectangle([(72,y+4),(84,y+14)], fill=C_V)
-    d.text((88,y+4), "Vegetarisch",    font=fprc, fill=C_TXT)
-    d.text((190,y+4), "Int = Mitarbeiterpreis", font=fprc, fill=(120,120,120))
+    d.rectangle([( 5,y+4),(15,y+13)], fill=C_VG)
+    d.text((19,y+3), 'Vegan',         font=fprc, fill=C_TXT)
+    d.rectangle([(65,y+4),(75,y+13)], fill=C_V)
+    d.text((79,y+3), 'Vegetarisch',   font=fprc, fill=C_TXT)
+    d.text((175,y+3), 'Int = Mitarbeiterpreis', font=fprc, fill=(120,120,120))
 
     _footer(d, kw, label, local_dt, fftr)
     return img
 
 def _footer(d, kw, label, local_dt, f):
-    txt = (f"KW {kw:02d} / {label}  –  "
-           f"{local_dt.strftime('%d.%m.%Y %H:%M Uhr')}  –  siemens.cateringportal.io")
-    d.rectangle([(0,H-24),(W,H)], fill=BLUE)
+    txt = (f'KW {kw:02d} / {label}  \u2013  '
+           f"{local_dt.strftime('%d.%m.%Y %H:%M Uhr')}  \u2013  siemens.cateringportal.io")
+    d.rectangle([(0,H-FOOTER_H),(W,H)], fill=BLUE)
     b = d.textbbox((0,0),txt,font=f)
-    d.text(((W-(b[2]-b[0]))//2,H-17),txt,font=f,fill=WHITE)
+    d.text(((W-(b[2]-b[0]))//2,H-16),txt,font=f,fill=WHITE)
+
+FOOTER_H = 22
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     now   = datetime.now(timezone.utc)
     local = german_time(now)
     label, kw = kw_label(now)
-    out_path  = OUT_DIR / f"kantine_{label}.jpg"
+    out_path  = OUT_DIR / f'kantine_{label}.jpg'
 
-    print(f"Target URL : {URL_MENU}")
-    print(f"Week label : {label}  (KW {kw:02d})")
+    print(f'Target URL : {URL_MENU}')
+    print(f'Week label : {label}  (KW {kw:02d})')
 
-    # 1. Load HTML
-    print("Loading page to find PDF link...")
+    # 1. Load HTML, find PDF URL
+    print('Loading page to find PDF link...')
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page    = browser.new_page(viewport={"width": 1200, "height": 900})
-        page.goto(URL_MENU, wait_until="load", timeout=60000)
+        page    = browser.new_page(viewport={'width': 1200, 'height': 900})
+        page.goto(URL_MENU, wait_until='load', timeout=60000)
         page.wait_for_timeout(3000)
-        print(f"  Page title: {page.title()}")
+        print(f'  Page title: {page.title()}')
         html = page.content()
         browser.close()
-    print(f"  HTML size: {len(html):,} bytes")
+    print(f'  HTML size: {len(html):,} bytes')
 
     pdf_url = find_pdf_url(html, kw)
     if not pdf_url:
-        print("ERROR: No qnips PDF URL found – rendering placeholder.")
+        print('ERROR: No qnips PDF URL found -> rendering placeholder.')
         img = render({}, kw, label, local)
-        img.save(str(out_path), "JPEG", quality=92)
-        print(f"Saved placeholder: {out_path}")
+        img.save(str(out_path), 'JPEG', quality=92)
+        print(f'Saved placeholder: {out_path}')
         return
 
     # 2. Download PDF
-    print(f"Downloading PDF...")
+    print(f'Downloading PDF...')
     pdf_bytes = download_pdf(pdf_url)
 
     # 3. Extract text
-    print("Extracting text from PDF...")
+    print('Extracting PDF text...')
     pdf_text = extract_pdf_text(pdf_bytes)
-    print("  PDF text preview (first 30 lines):")
-    for line in pdf_text.splitlines()[:30]:
-        if line.strip():
-            print(f"    {repr(line)}")
 
     # 4. Parse menu
-    print("Parsing menu...")
-    week_data = parse_menu_from_text(pdf_text, local)
-    print(f"  Days parsed: {list(week_data.keys())}")
-    for day, meals in week_data.items():
-        print(f"  {day}:")
-        for m in meals:
-            print(f"    [{m['kategorie']}] {m['name'][:70]} | vv={m['vv']} | {m['preis_int']}")
+    print('Parsing menu items...')
+    week_data = parse_menu(pdf_text, local)
+    print(f'Days parsed: {list(week_data.keys())}')
 
-    # 5. Render JPEG
+    # 5. Render
     img = render(week_data, kw, label, local)
-    img.save(str(out_path), "JPEG", quality=92)
-    print(f"Saved: {out_path}  ({img.size[0]}x{img.size[1]})")
+    img.save(str(out_path), 'JPEG', quality=92)
+    print(f'Saved: {out_path}  ({img.size[0]}x{img.size[1]})')
 
     # 6. Cleanup
-    for old in sorted(OUT_DIR.glob("kantine_*.jpg"))[:-MAX_KEEP]:
+    for old in sorted(OUT_DIR.glob('kantine_*.jpg'))[:-MAX_KEEP]:
         old.unlink()
-        print(f"Removed: {old}")
+        print(f'Removed: {old}')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
