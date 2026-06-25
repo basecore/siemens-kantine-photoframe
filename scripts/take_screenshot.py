@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
-"""Siemens Kantine Regensburg – 800x600 JPEG from cateringportal.io DOM.
+"""Siemens Kantine Regensburg – 800x600 JPEG.
 
-Scraping strategy (no PDF needed):
-  1. Playwright loads the Monday-URL so all 5 days are in the DOM.
-  2. Injected JS walks the rendered Angular SPA and extracts:
-       - Tab labels (day names + dates)
-       - Per-tab: category rows (Suppe / Essen 1-3) and their dishes
-       - Per-dish: name, int-price, vegan/vegetarian flag
-  3. Multiple JS extraction strategies tried in order:
-       A. mat-tab / Angular Material tabs  (most likely)
-       B. role=tabpanel panels
-       C. Flat text with Int/Ext price as day separator
-  4. Bavarian public holidays are computed and shown as grey columns.
+The cateringportal only shows today + remaining days of the week.
+To get the full week we load each day’s URL separately:
+  /date/2026-06-23  -> shows Mon (and later days, but we only read the FIRST tab)
+  /date/2026-06-24  -> shows Tue ...
+  ...
+One Playwright browser session is reused for all 5 requests.
 """
-import json, os, re
+import os, re
 from pathlib import Path
 from datetime import date, datetime, timezone, timedelta
 
@@ -57,16 +52,16 @@ def lf(size, bold=False):
 
 # ── Bavarian holidays ─────────────────────────────────────────────────────────
 def _easter(y):
-    a=y%19; b=y//100; c=y%100; d=b//4; e=b%4
-    f=(b+8)//25; g=(b-f+1)//3
+    a=y%19;b=y//100;c=y%100;d=b//4;e=b%4
+    f=(b+8)//25;g=(b-f+1)//3
     h=(19*a+b-d-g+15)%30
-    i=c//4; k=c%4; l=(32+2*e+2*i-h-k)%7
+    i=c//4;k=c%4;l=(32+2*e+2*i-h-k)%7
     m=(a+11*h+22*l)//451
-    mo=(h+l-7*m+114)//31; dy=((h+l-7*m+114)%31)+1
-    return date(y, mo, dy)
+    mo=(h+l-7*m+114)//31;dy=((h+l-7*m+114)%31)+1
+    return date(y,mo,dy)
 
 def bavaria_holidays(y):
-    e = _easter(y)
+    e=_easter(y)
     return {
         date(y,1,1):   "Neujahr",
         date(y,1,6):   "Hl. Drei K\u00f6nige",
@@ -86,23 +81,21 @@ def bavaria_holidays(y):
     }
 
 def week_holiday_map(local_dt):
-    monday = local_dt.date() - timedelta(days=local_dt.weekday())
-    y      = monday.year
-    hols   = bavaria_holidays(y)
-    if (monday+timedelta(4)).year != y:
-        hols.update(bavaria_holidays(y+1))
-    short  = ['Mo','Di','Mi','Do','Fr']
+    monday=local_dt.date()-timedelta(days=local_dt.weekday())
+    y=monday.year
+    hols=bavaria_holidays(y)
+    if (monday+timedelta(4)).year!=y: hols.update(bavaria_holidays(y+1))
+    short=['Mo','Di','Mi','Do','Fr']
     return {f"{short[i]} {(monday+timedelta(i)).strftime('%d.%m')}": hols.get(monday+timedelta(i))
             for i in range(5)}
 
-# ── Time ──────────────────────────────────────────────────────────────────────
+# ── Time helpers ─────────────────────────────────────────────────────────────
 def german_time(dt):
     try:
         from zoneinfo import ZoneInfo
         return dt.astimezone(ZoneInfo("Europe/Berlin"))
     except ImportError: pass
-    import calendar
-    yr = dt.year
+    import calendar; yr=dt.year
     def last_sun(y,m):
         ld=calendar.monthrange(y,m)[1]
         d2=datetime(y,m,ld,tzinfo=timezone.utc)
@@ -112,320 +105,187 @@ def german_time(dt):
 
 def kw_label(dt):
     d=german_time(dt); y,w,_=d.isocalendar()
-    return f"{y}-W{w:02d}", int(w)
+    return f"{y}-W{w:02d}",int(w)
 
-def day_keys(local_dt):
+def week_dates(local_dt):
     monday=local_dt-timedelta(days=local_dt.weekday())
+    return [(monday+timedelta(i)) for i in range(5)]
+
+def day_key(dt_obj):
     short=['Mo','Di','Mi','Do','Fr']
-    return [f"{short[i]} {(monday+timedelta(i)).strftime('%d.%m')}" for i in range(5)]
+    return f"{short[dt_obj.weekday()]} {dt_obj.strftime('%d.%m')}"
 
-# ── JS extraction scripts ──────────────────────────────────────────────────────
+# ── JS: extract the FIRST visible day from current page ───────────────────────────────
+# The page loaded with /date/2026-06-23 shows Mon as active tab.
+# We extract all category rows from the ACTIVE (first) tab panel.
 
-# Strategy A: Angular Material mat-tab-group
-JS_MAT_TABS = """
+JS_EXTRACT_DAY = """
 (function(){
-  var result = {};
-  // Find all mat-tab-label elements for day names
-  var labels = Array.from(document.querySelectorAll(
-    'mat-tab-header .mat-tab-label, mat-tab-header .mdc-tab, [role="tab"]'
-  ));
-  var bodies  = Array.from(document.querySelectorAll(
-    'mat-tab-body, .mat-tab-body, [role="tabpanel"]'
-  ));
-  if (!labels.length || !bodies.length) return null;
-
-  for (var ti = 0; ti < Math.min(labels.length, bodies.length); ti++) {
-    var dayLabel = labels[ti].textContent.trim().replace(/\\s+/g,' ');
-    if (!dayLabel) continue;
-    var body  = bodies[ti];
-    var dishes = [];
-
-    // Each category row: look for headings like 'Food 1', 'Soup / Starter' etc.
-    var catNodes = body.querySelectorAll(
-      '[class*="category"], [class*="course"], [class*="menu-item"], ' +
-      '[class*="meal"], [class*="dish"], tr, li'
-    );
-
-    // Fallback: just grab all text nodes with prices
-    var allText = body.innerText || body.textContent || '';
-    var lines   = allText.split('\\n').map(s=>s.trim()).filter(Boolean);
-
-    var catMap = {
-      'Soup / Starter':'Suppe','Soup/Starter':'Suppe','Soup':'Suppe',
-      'Food 1':'Essen 1','Food 2':'Essen 2','Food 3':'Essen 3',
-      'Essen 1':'Essen 1','Essen 2':'Essen 2','Essen 3':'Essen 3'
-    };
-    var curCat = null, curToks = [], priceRe = /^\\d+[.,]\\d{2}$/, intRe = /^Int$/i, extRe = /^Ext$/i;
-    for (var li2=0; li2<lines.length; li2++){
-      var tok = lines[li2];
-      if (catMap[tok]) { curCat=catMap[tok]; curToks=[]; continue; }
-      if (!curCat) continue;
-      if (intRe.test(tok)) {
-        var nextTok = lines[li2+1] || '';
-        if (priceRe.test(nextTok.replace(/[\u20ac$]/,''))) {
-          var price = nextTok.replace(/[\u20ac$]/,'');
-          var name  = curToks.filter(t=>!/^[A-H](\\.[1-6])?$/.test(t)&&!/^(or|oder)$/i.test(t)).join(' ').trim();
-          if (name.length>=3) {
-            var low=name.toLowerCase();
-            dishes.push({cat:curCat, name:name, price:price,
-              vv: low.includes('vegan')?'VG': low.includes('vegetar')?'V':''});
-          }
-          curToks=[]; li2+=1;
-          if ((lines[li2+1]||'').match(/^Ext$/i)) li2+=2;
-          continue;
-        }
-      }
-      if (!extRe.test(tok) && !priceRe.test(tok.replace(/[\u20ac$]/,''))) curToks.push(tok);
-    }
-    result[dayLabel] = dishes;
-  }
-  return Object.keys(result).length ? result : null;
-})()
-"""
-
-# Strategy B: find day containers by looking for date pattern DD.MM inside any block
-JS_DATE_BLOCKS = """
-(function(){
-  var result = {};
-  var dateRe  = /\\b(\\d{2}\\.\\d{2})\\.?\\b/;
-  var priceRe = /^\\d+[.,]\\d{2}$/;
-  var intRe   = /^Int$/i, extRe=/^Ext$/i;
-  var catMap  = {
+  var catMap = {
     'Soup / Starter':'Suppe','Soup/Starter':'Suppe','Soup':'Suppe',
     'Food 1':'Essen 1','Food 2':'Essen 2','Food 3':'Essen 3',
-    'Essen 1':'Essen 1','Essen 2':'Essen 2','Essen 3':'Essen 3'
+    'Essen 1':'Essen 1','Essen 2':'Essen 2','Essen 3':'Essen 3',
+    'Gericht 1':'Essen 1','Gericht 2':'Essen 2','Gericht 3':'Essen 3'
   };
+  var intRe=/^Int$/i, extRe=/^Ext$/i;
+  var priceRe=/^[\u20ac$]?(\d+[.,]\d{2})$/;
+  var allgRe=/^[A-H](\.[1-6])?$/;
+  var orRe=/^(or|oder)$/i;
+  var noiseWords=new Set(['Learn more','Got it!','home','Home','Menu','Stores',
+    'Impressum','close','Close','English','Lunch','Filter','Store','clear','Info',
+    'New Webportal','Register now:','MyCasinoCard','Opening hours']);
 
-  // Walk all block-level elements, find those that contain a date in their heading
-  var candidates = document.querySelectorAll(
-    'section, article, div[class*="day"], div[class*="column"], '
-    + 'div[class*="tab"], td[class*="day"], div[class*="week"] > div'
-  );
-
-  candidates.forEach(function(el){
-    var hd = el.querySelector('h1,h2,h3,h4,h5,th,strong,[class*="header"],[class*="title"]');
-    if (!hd) return;
-    var hdTxt = hd.textContent.trim();
-    var dm = hdTxt.match(dateRe); if (!dm) return;
-
-    var lines = (el.innerText||el.textContent||'').split('\\n').map(s=>s.trim()).filter(Boolean);
+  function parseDishes(lines) {
     var dishes=[], curCat=null, curToks=[];
     for (var i=0;i<lines.length;i++) {
       var tok=lines[i];
-      if (catMap[tok]){curCat=catMap[tok];curToks=[];continue;}
+      if (catMap[tok]) { curCat=catMap[tok]; curToks=[]; continue; }
       if (!curCat) continue;
-      if (intRe.test(tok) && priceRe.test((lines[i+1]||'').replace(/[\u20ac$]/,''))){
-        var price=(lines[i+1]||'').replace(/[\u20ac$]/,'');
-        var name=curToks.filter(t=>!/^[A-H](\\.[1-6])?$/.test(t)&&!/^(or|oder)$/i.test(t)).join(' ').trim();
-        if(name.length>=3){
-          var low=name.toLowerCase();
-          dishes.push({cat:curCat,name:name,price:price,
-            vv:low.includes('vegan')?'VG':low.includes('vegetar')?'V':''});
+      if (intRe.test(tok)) {
+        var nxt=lines[i+1]||'';
+        var pm=nxt.match(priceRe);
+        if (pm) {
+          var price=pm[1];
+          var name=curToks.filter(t=>!allgRe.test(t)&&!orRe.test(t)&&!noiseWords.has(t)).join(' ').trim();
+          if (name.length>=3) {
+            var low=name.toLowerCase();
+            dishes.push({cat:curCat,name:name,price:price,
+              vv:low.includes('vegan')?'VG':low.includes('vegetar')?'V':''});
+          }
+          curToks=[]; i+=1;
+          if ((lines[i+1]||'').match(/^Ext$/i)) {
+            i+=1;
+            if ((lines[i+1]||'').match(priceRe)) i+=1;
+          }
+          continue;
         }
-        curToks=[];i+=1;
-        if((lines[i+1]||'').match(/^Ext$/i))i+=2;
+      }
+      if (extRe.test(tok)) {
+        if ((lines[i+1]||'').match(priceRe)) i+=1;
         continue;
       }
-      if(!extRe.test(tok)&&!priceRe.test(tok.replace(/[\u20ac$]/,''))) curToks.push(tok);
+      if (!allgRe.test(tok) && !noiseWords.has(tok)) curToks.push(tok);
     }
-    if(dishes.length) result[hdTxt]=dishes;
-  });
-  return Object.keys(result).length>=3 ? result : null;
+    // flush last dish without trailing Int price
+    if (curCat && curToks.length) {
+      var name=curToks.filter(t=>!allgRe.test(t)&&!orRe.test(t)&&!noiseWords.has(t)).join(' ').trim();
+      if (name.length>=3) {
+        var low=name.toLowerCase();
+        dishes.push({cat:curCat,name:name,price:'',
+          vv:low.includes('vegan')?'VG':low.includes('vegetar')?'V':''});
+      }
+    }
+    return dishes;
+  }
+
+  // --- Try A: mat-tab-body (Angular Material) ---
+  // The first mat-tab-body that is visible (not hidden) = active day
+  var panels = Array.from(document.querySelectorAll(
+    'mat-tab-body, [role="tabpanel"], .mat-tab-body'));
+  var activePanel = panels.find(p=>{
+    var s=window.getComputedStyle(p);
+    return s.display!=='none' && s.visibility!=='hidden' && p.offsetHeight>0;
+  }) || panels[0];
+
+  if (activePanel) {
+    var lines=(activePanel.innerText||activePanel.textContent||'')
+      .split('\n').map(s=>s.trim()).filter(Boolean);
+    var dishes=parseDishes(lines);
+    if (dishes.length) return {strategy:'mat-tab', dishes:dishes};
+  }
+
+  // --- Try B: find container with category header ---
+  var allEls=Array.from(document.querySelectorAll('div,section,article,td'));
+  for (var ei=0;ei<allEls.length;ei++) {
+    var el=allEls[ei];
+    var txt=el.innerText||el.textContent||'';
+    if (!Object.keys(catMap).some(k=>txt.includes(k))) continue;
+    // Must be a leaf-ish container (not the whole page)
+    if (txt.length>8000) continue;
+    var lines=txt.split('\n').map(s=>s.trim()).filter(Boolean);
+    var dishes=parseDishes(lines);
+    if (dishes.length>=2) return {strategy:'block', dishes:dishes};
+  }
+
+  // --- Try C: full page flat ---
+  var body=document.body.cloneNode(true);
+  body.querySelectorAll('script,style,noscript').forEach(e=>e.remove());
+  var lines=(body.innerText||body.textContent||'')
+    .split('\n').map(s=>s.trim()).filter(Boolean);
+  var dishes=parseDishes(lines);
+  if (dishes.length) return {strategy:'flat', dishes:dishes};
+
+  return null;
 })()
 """
 
-# Strategy C: full-page flat text, use day-header lines as separators
-JS_FLAT = """
-(function(){
-  // Remove script/style nodes
-  var clone = document.body.cloneNode(true);
-  clone.querySelectorAll('script,style,noscript').forEach(e=>e.remove());
-  var text = clone.innerText || clone.textContent || '';
-  return text;
-})()
-"""
 
-# ── Playwright scraper ─────────────────────────────────────────────────────────
-def scrape(url: str, keys: list[str]) -> tuple[dict, str]:
+# ── Scrape one day ──────────────────────────────────────────────────────────────────
+def scrape_day(page, date_obj) -> list:
     """
-    Returns (week_data, strategy_name).
-    week_data = {day_key: [{kategorie, name, preis_int, vv}, ...]}
+    Navigate to /date/YYYY-MM-DD and extract dishes for that day.
+    Returns list of {kategorie, name, preis_int, vv}
     """
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page(
-            viewport={"width": 1400, "height": 900},
-            extra_http_headers={"Accept-Language": "de-DE,de;q=0.9"},
-        )
-        page.goto(url, wait_until="networkidle", timeout=60000)
-        print("  Waiting for menu content...")
-        # Wait for either German or English category label
-        for sel in ["text=Food 1","text=Essen 1","text=Food 2","text=Suppe"]:
-            try: page.wait_for_selector(sel, timeout=10000); print(f"  found: {sel!r}"); break
-            except Exception: pass
-        # Extra wait for lazy Angular rendering
-        page.wait_for_timeout(3000)
-        print(f"  Title: {page.title()}")
+    url = f"{URL_BASE}/date/{date_obj.strftime('%Y-%m-%d')}"
+    if _SID: url += f"?ste_sid={_SID}"
+    print(f"  Loading {url}")
+    page.goto(url, wait_until="networkidle", timeout=60000)
 
-        # --- Strategy A: mat-tabs JS ---
-        raw = page.evaluate(JS_MAT_TABS)
-        if raw and isinstance(raw, dict) and len(raw) >= 3:
-            browser.close()
-            return _map_js_result(raw, keys), "DOM-MatTabs"
-        print("  StratA failed, trying StratB...")
+    # Wait for category labels to appear
+    found = False
+    for sel in ["text=Food 1","text=Essen 1","text=Food 2",
+                "text=Soup","text=Suppe","text=Food 3"]:
+        try:
+            page.wait_for_selector(sel, timeout=8000)
+            found = True
+            break
+        except Exception:
+            pass
+    if not found:
+        page.wait_for_timeout(5000)
+    page.wait_for_timeout(1500)  # small extra wait for Angular
 
-        # --- Strategy B: date-block JS ---
-        raw = page.evaluate(JS_DATE_BLOCKS)
-        if raw and isinstance(raw, dict) and len(raw) >= 3:
-            browser.close()
-            return _map_js_result(raw, keys), "DOM-DateBlocks"
-        print("  StratB failed, trying StratC (flat)...")
+    result = page.evaluate(JS_EXTRACT_DAY)
+    if not result or not result.get('dishes'):
+        print(f"    -> no dishes found")
+        return []
 
-        # --- Strategy C: flat text ---
-        flat_text = page.evaluate(JS_FLAT) or ""
+    strategy = result.get('strategy','?')
+    raw_dishes = result['dishes']
 
-        # Also dump HTML for debugging
-        html = page.content()
-        browser.close()
+    # Keep first dish per category
+    seen_cats = {}
+    for d in raw_dishes:
+        cat = d.get('cat','Essen 1')
+        if cat not in seen_cats:
+            seen_cats[cat] = d
 
-    print(f"  Flat text length: {len(flat_text)}")
-    week_data = _parse_flat(flat_text, keys)
-    if week_data:
-        return week_data, "DOM-Flat"
-
-    # Last resort: print first 120 lines for debugging
-    print("  All strategies failed. First 120 lines of flat text:")
-    for i, l in enumerate(flat_text.splitlines()[:120]):
-        print(f"    {i:3d}: {l[:120]}")
-    return {}, "FAILED"
-
-
-def _map_js_result(raw: dict, keys: list[str]) -> dict:
-    """
-    Maps JS result {label: [{cat,name,price,vv}]} to week_data {day_key: [dish_dicts]}.
-    Tries to match labels to day_keys by DD.MM date substring.
-    """
-    date_re = re.compile(r'(\d{2}\.\d{2})')
-    # Build lookup: '22.06' -> 'Mo 22.06'
-    key_by_date = {}
-    for k in keys:
-        m = date_re.search(k)
-        if m: key_by_date[m.group(1)] = k
-
-    week_data = {}
-    for label, dishes in raw.items():
-        # Match by date in label
-        m = date_re.search(label)
-        day_key = key_by_date.get(m.group(1)) if m else None
-        if not day_key:
-            # Try positional match (0->Mo, 1->Di ...)
-            idx = list(raw.keys()).index(label)
-            day_key = keys[idx] if idx < len(keys) else None
-        if not day_key: continue
-
-        CAT_ORDER = ['Suppe','Essen 1','Essen 2','Essen 3']
-        # Group dishes by category, keep first per cat
-        by_cat = {}
-        for d in dishes:
-            cat = d.get('cat','Essen 1')
-            if cat not in by_cat: by_cat[cat] = d
-        week_data[day_key] = [
-            {'kategorie': cat, 'name': by_cat[cat]['name'],
-             'preis_int': by_cat[cat].get('price','') + ' \u20ac' if by_cat[cat].get('price') else '',
-             'vv': by_cat[cat].get('vv','')}
-            for cat in CAT_ORDER if cat in by_cat
-        ]
-        print(f"  {day_key}: {[d['name'][:30] for d in week_data[day_key]]}")
-    return week_data
-
-
-def _parse_flat(text: str, open_days: list[str]) -> dict:
-    """
-    Flat-text fallback.
-    Category headers separate blocks; Int+price = one day boundary.
-    """
-    CAT_HEADERS = {
-        'Soup / Starter':'Suppe','Soup/Starter':'Suppe','Soup':'Suppe',
-        'Food 1':'Essen 1','Food 2':'Essen 2','Food 3':'Essen 3',
-        'Essen 1':'Essen 1','Essen 2':'Essen 2','Essen 3':'Essen 3',
-        'Gericht 1':'Essen 1','Gericht 2':'Essen 2','Gericht 3':'Essen 3',
-    }
-    UI_NOISE = {
-        'Learn more','Got it!','home','Home','view_compact','Menu','place',
-        'Stores','Impressum','close','Close','English','menu','Lunch',
-        'filter_list','Filter','Store','clear','Info','New Webportal',
-        'Register now:','MyCasinoCard','Opening hours','edit your personal profile',
-        'view transactions','QR Code for payment','Use digital wallet to store QR Code',
-        'change card status','other features','Go to MyCasinoCard',
-    }
-    INT_RE  = re.compile(r'^Int$', re.I)
-    EXT_RE  = re.compile(r'^Ext$', re.I)
-    PRIC_RE = re.compile(r'^[\u20ac$]?\d+[.,]\d{2}$')
-    ALLG_RE = re.compile(r'^[A-H](\.[1-6])?$')
-    OR_RE   = re.compile(r'^(or|oder)$', re.I)
-
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    menu_start = next((i for i,l in enumerate(lines) if l in CAT_HEADERS), None)
-    if menu_start is None: return {}
-    print(f"  [flat] menu starts at line {menu_start}: {lines[menu_start]!r}")
-
-    blocks, cur_cat, cur_lines = [], None, []
-    for line in lines[menu_start:]:
-        if line in CAT_HEADERS:
-            if cur_cat: blocks.append((cur_cat, cur_lines))
-            cur_cat, cur_lines = CAT_HEADERS[line], []
-        elif cur_cat: cur_lines.append(line)
-    if cur_cat: blocks.append((cur_cat, cur_lines))
-    print(f"  [flat] blocks: {[b[0] for b in blocks]}")
-
-    n = len(open_days)
-    week_data = {k: [] for k in open_days}
-    for cat_label, raw in blocks:
-        cur, day_idx, i = [], 0, 0
-        while i < len(raw) and day_idx < n:
-            tok = raw[i]
-            if INT_RE.match(tok) and i+1 < len(raw) and PRIC_RE.match(raw[i+1]):
-                price = raw[i+1].lstrip('\u20ac$') + ' \u20ac'
-                name_toks = [t for t in cur if not ALLG_RE.match(t) and not OR_RE.match(t)]
-                name = ' '.join(name_toks).strip()
-                if name and len(name) >= 3:
-                    low = name.lower()
-                    week_data[open_days[day_idx]].append({
-                        'kategorie': cat_label, 'name': name, 'preis_int': price,
-                        'vv': 'VG' if 'vegan' in low else ('V' if 'vegetar' in low else '')
-                    })
-                cur = []; day_idx += 1; i += 2
-                if i < len(raw) and EXT_RE.match(raw[i]):
-                    i += 1
-                    if i < len(raw) and PRIC_RE.match(raw[i]): i += 1
-                continue
-            if EXT_RE.match(tok):
-                i += 1
-                if i < len(raw) and PRIC_RE.match(raw[i]): i += 1
-                continue
-            if tok in CAT_HEADERS or tok in UI_NOISE: break
-            if not ALLG_RE.match(tok): cur.append(tok)
-            i += 1
-        print(f"  [flat] {cat_label}: {day_idx}/{n} days")
-    return {k: v for k, v in week_data.items() if v}
+    CAT_ORDER = ['Suppe','Essen 1','Essen 2','Essen 3']
+    dishes = []
+    for cat in CAT_ORDER:
+        if cat in seen_cats:
+            d = seen_cats[cat]
+            price = d.get('price','')
+            dishes.append({
+                'kategorie': cat,
+                'name':      d['name'],
+                'preis_int': price + ' \u20ac' if price else '',
+                'vv':        d.get('vv','')
+            })
+    print(f"    -> {strategy}: {[d['name'][:28] for d in dishes]}")
+    return dishes
 
 
 # ── Render ──────────────────────────────────────────────────────────────────────
 def wrap_text(draw, text, f, max_w):
-    words=text.split(); out,cur=[],[]
-    for w in words:
-        t=(cur+' '+w if cur else w).strip() if isinstance(cur,str) else ' '.join(cur+[w])
-        # simpler version
-        t=((' '.join(out[-1:]+[w])) if out else w)  # unused, rebuild below
-    # clean rebuild
     out2, cur2 = [], ''
-    for w in words:
-        t=(cur2+' '+w).strip() if cur2 else w
-        b=draw.textbbox((0,0),t,font=f)
-        if b[2]-b[0]<=max_w: cur2=t
+    for w in text.split():
+        t = (cur2+' '+w).strip() if cur2 else w
+        b = draw.textbbox((0,0),t,font=f)
+        if b[2]-b[0] <= max_w: cur2 = t
         else:
             if cur2: out2.append(cur2)
-            cur2=w
+            cur2 = w
     if cur2: out2.append(cur2)
     return out2
 
@@ -444,12 +304,7 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, source=''):
     d.text(((W-(b[2]-b[0]))//2,(HDR_H-(b[3]-b[1]))//2),title,font=ftit,fill=WHITE)
     y=HDR_H
 
-    if not week_data and not any(v for v in holiday_map.values() if v):
-        d.text((20,y+40),'Speiseplan nicht verf\u00fcgbar.',font=ftxt,fill=C_TXT)
-        d.text((20,y+60),url_menu,font=ftxt,fill=LIGHT)
-        _footer(d,kw,label,local_dt,fftr,source); return img
-
-    all_days=list(holiday_map.keys())  # Mo..Fr always 5
+    all_days=list(holiday_map.keys())
     dw=W//len(all_days); DAY_H=20
     for i,day in enumerate(all_days):
         x=i*dw; is_hol=holiday_map[day] is not None
@@ -532,32 +387,44 @@ def _footer(d,kw,label,local_dt,f,source=''):
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
-    now  = datetime.now(timezone.utc)
-    local= german_time(now)
-    label,kw = kw_label(now)
-    out_path = OUT_DIR/f'kantine_{label}.jpg'
+    now   = datetime.now(timezone.utc)
+    local = german_time(now)
+    label, kw = kw_label(now)
+    out_path  = OUT_DIR / f'kantine_{label}.jpg'
 
-    monday   = local - timedelta(days=local.weekday())
-    date_str = monday.strftime('%Y-%m-%d')
-    url_menu = f"{URL_BASE}/date/{date_str}"
-    if _SID: url_menu += f"?ste_sid={_SID}"
-
-    print(f'Target URL : {url_menu}')
     print(f'Week label : {label}  (KW {kw:02d})')
 
     holiday_map = week_holiday_map(local)
-    open_days   = [k for k,v in holiday_map.items() if v is None]
     hol_days    = [k for k,v in holiday_map.items() if v]
+    open_dates  = [d for d in week_dates(local) if day_key(d) not in hol_days]
+
     if hol_days:
-        print(f'Feiertage: {[(k,holiday_map[k]) for k in hol_days]}')
-    print(f'Offene Tage: {open_days}')
+        print(f'Feiertage: {[(k, holiday_map[k]) for k in hol_days]}')
+    print(f'Lade {len(open_dates)} Tage einzeln...')
 
-    all_keys = day_keys(local)
-    print('Scraping...')
-    week_data, source = scrape(url_menu, all_keys)
-    print(f'Result: {list(week_data.keys())}  source={source}')
+    week_data = {}
+    strategies_used = set()
 
-    img = render(week_data, kw, label, local, url_menu, holiday_map, source)
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        page = browser.new_page(
+            viewport={"width": 1400, "height": 900},
+            extra_http_headers={"Accept-Language": "de-DE,de;q=0.9"},
+        )
+        for date_obj in open_dates:
+            dk = day_key(date_obj)
+            dishes = scrape_day(page, date_obj)
+            if dishes:
+                week_data[dk] = dishes
+        browser.close()
+
+    print(f'Ergebnis: {list(week_data.keys())}')
+    days_filled = len(week_data)
+    days_open   = len(open_dates)
+    source = f'DOM ({days_filled}/{days_open} Tage)'
+
+    img = render(week_data, kw, label, local,
+                 URL_BASE, holiday_map, source)
     img.save(str(out_path), 'JPEG', quality=92)
     print(f'Saved: {out_path}  ({img.size[0]}x{img.size[1]})')
 
