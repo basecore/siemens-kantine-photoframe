@@ -2,8 +2,8 @@
 """Siemens Kantine Regensburg – 800x600 JPEG.
 
 The cateringportal only shows today + remaining days of the week.
-To get the full week we load each day’s URL separately:
-  /date/2026-06-23  -> shows Mon (and later days, but we only read the FIRST tab)
+To get the full week we load each day's URL separately:
+  /date/2026-06-23  -> shows Mon as first/active tab
   /date/2026-06-24  -> shows Tue ...
   ...
 One Playwright browser session is reused for all 5 requests.
@@ -15,7 +15,7 @@ from datetime import date, datetime, timezone, timedelta
 from playwright.sync_api import sync_playwright
 from PIL import Image, ImageDraw, ImageFont
 
-# ── Config ───────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 URL_BASE = os.environ.get(
     "CATERINGPORTAL_URL",
     "https://siemens.cateringportal.io/menu/Regensburg/Mittagessen",
@@ -28,7 +28,7 @@ MAX_KEEP = 8
 W, H     = 800, 600
 FOOTER_H = 22
 
-# ── Colours ──────────────────────────────────────────────────────────────────
+# ── Colours ───────────────────────────────────────────────────────────────────
 BLUE  = (0, 57, 107);   LIGHT = (0, 119, 193)
 R_ODD = (240, 246, 252); R_EVEN = (255, 255, 255)
 C_VG  = (34, 139, 34);  C_V    = (100, 180, 60)
@@ -89,7 +89,7 @@ def week_holiday_map(local_dt):
     return {f"{short[i]} {(monday+timedelta(i)).strftime('%d.%m')}": hols.get(monday+timedelta(i))
             for i in range(5)}
 
-# ── Time helpers ─────────────────────────────────────────────────────────────
+# ── Time helpers ──────────────────────────────────────────────────────────────
 def german_time(dt):
     try:
         from zoneinfo import ZoneInfo
@@ -115,11 +115,8 @@ def day_key(dt_obj):
     short=['Mo','Di','Mi','Do','Fr']
     return f"{short[dt_obj.weekday()]} {dt_obj.strftime('%d.%m')}"
 
-# ── JS: extract the FIRST visible day from current page ───────────────────────────────
-# The page loaded with /date/2026-06-23 shows Mon as active tab.
-# We extract all category rows from the ACTIVE (first) tab panel.
-
-JS_EXTRACT_DAY = """
+# ── JS extractor (raw string → no Python escape issues) ───────────────────────
+JS_EXTRACT_DAY = r"""
 (function(){
   var catMap = {
     'Soup / Starter':'Suppe','Soup/Starter':'Suppe','Soup':'Suppe',
@@ -128,7 +125,7 @@ JS_EXTRACT_DAY = """
     'Gericht 1':'Essen 1','Gericht 2':'Essen 2','Gericht 3':'Essen 3'
   };
   var intRe=/^Int$/i, extRe=/^Ext$/i;
-  var priceRe=/^[\u20ac$]?(\d+[.,]\d{2})$/;
+  var priceRe=/^[€$]?(\d+[.,]\d{2})$/;
   var allgRe=/^[A-H](\.[1-6])?$/;
   var orRe=/^(or|oder)$/i;
   var noiseWords=new Set(['Learn more','Got it!','home','Home','Menu','Stores',
@@ -166,7 +163,7 @@ JS_EXTRACT_DAY = """
       }
       if (!allgRe.test(tok) && !noiseWords.has(tok)) curToks.push(tok);
     }
-    // flush last dish without trailing Int price
+    // flush last item without trailing Int price (e.g. no-price entry)
     if (curCat && curToks.length) {
       var name=curToks.filter(t=>!allgRe.test(t)&&!orRe.test(t)&&!noiseWords.has(t)).join(' ').trim();
       if (name.length>=3) {
@@ -178,8 +175,7 @@ JS_EXTRACT_DAY = """
     return dishes;
   }
 
-  // --- Try A: mat-tab-body (Angular Material) ---
-  // The first mat-tab-body that is visible (not hidden) = active day
+  // Strategy A: Angular Material – first VISIBLE mat-tab-body
   var panels = Array.from(document.querySelectorAll(
     'mat-tab-body, [role="tabpanel"], .mat-tab-body'));
   var activePanel = panels.find(p=>{
@@ -194,20 +190,19 @@ JS_EXTRACT_DAY = """
     if (dishes.length) return {strategy:'mat-tab', dishes:dishes};
   }
 
-  // --- Try B: find container with category header ---
+  // Strategy B: smallest container that contains a category keyword
   var allEls=Array.from(document.querySelectorAll('div,section,article,td'));
   for (var ei=0;ei<allEls.length;ei++) {
     var el=allEls[ei];
     var txt=el.innerText||el.textContent||'';
     if (!Object.keys(catMap).some(k=>txt.includes(k))) continue;
-    // Must be a leaf-ish container (not the whole page)
     if (txt.length>8000) continue;
     var lines=txt.split('\n').map(s=>s.trim()).filter(Boolean);
     var dishes=parseDishes(lines);
     if (dishes.length>=2) return {strategy:'block', dishes:dishes};
   }
 
-  // --- Try C: full page flat ---
+  // Strategy C: full page flat text
   var body=document.body.cloneNode(true);
   body.querySelectorAll('script,style,noscript').forEach(e=>e.remove());
   var lines=(body.innerText||body.textContent||'')
@@ -215,68 +210,79 @@ JS_EXTRACT_DAY = """
   var dishes=parseDishes(lines);
   if (dishes.length) return {strategy:'flat', dishes:dishes};
 
+  // Debug dump
+  console.log('KANTINE_DEBUG_LINES:', JSON.stringify(lines.slice(0,80)));
   return null;
 })()
 """
 
-
-# ── Scrape one day ──────────────────────────────────────────────────────────────────
+# ── Scrape one day ────────────────────────────────────────────────────────────
 def scrape_day(page, date_obj) -> list:
-    """
-    Navigate to /date/YYYY-MM-DD and extract dishes for that day.
-    Returns list of {kategorie, name, preis_int, vv}
-    """
     url = f"{URL_BASE}/date/{date_obj.strftime('%Y-%m-%d')}"
     if _SID: url += f"?ste_sid={_SID}"
     print(f"  Loading {url}")
-    page.goto(url, wait_until="networkidle", timeout=60000)
 
-    # Wait for category labels to appear
+    # domcontentloaded is enough – SPA never reaches networkidle
+    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+
+    # Wait for Angular to render category labels
     found = False
-    for sel in ["text=Food 1","text=Essen 1","text=Food 2",
-                "text=Soup","text=Suppe","text=Food 3"]:
+    for sel in ["text=Food 1", "text=Essen 1", "text=Food 2",
+                "text=Soup",   "text=Suppe",   "text=Food 3",
+                "text=Gericht 1"]:
         try:
-            page.wait_for_selector(sel, timeout=8000)
+            page.wait_for_selector(sel, timeout=10000)
             found = True
+            print(f"    found selector: {sel!r}")
             break
         except Exception:
             pass
     if not found:
-        page.wait_for_timeout(5000)
-    page.wait_for_timeout(1500)  # small extra wait for Angular
+        print("    no category selector found, waiting 6s extra...")
+        page.wait_for_timeout(6000)
+    else:
+        page.wait_for_timeout(1500)  # brief settle for late renders
 
     result = page.evaluate(JS_EXTRACT_DAY)
     if not result or not result.get('dishes'):
-        print(f"    -> no dishes found")
+        # Print flat lines for debugging
+        flat = page.evaluate(r"""
+            (function(){
+              var b=document.body.cloneNode(true);
+              b.querySelectorAll('script,style,noscript').forEach(e=>e.remove());
+              return (b.innerText||b.textContent||'')
+                .split('\n').map(s=>s.trim()).filter(Boolean).slice(0,80);
+            })()
+        """)
+        print(f"    -> no dishes. First 80 lines:")
+        for i, l in enumerate(flat or []):
+            print(f"      {i:3d}: {l[:100]}")
         return []
 
-    strategy = result.get('strategy','?')
+    strategy   = result.get('strategy', '?')
     raw_dishes = result['dishes']
 
-    # Keep first dish per category
     seen_cats = {}
     for d in raw_dishes:
-        cat = d.get('cat','Essen 1')
+        cat = d.get('cat', 'Essen 1')
         if cat not in seen_cats:
             seen_cats[cat] = d
 
-    CAT_ORDER = ['Suppe','Essen 1','Essen 2','Essen 3']
     dishes = []
-    for cat in CAT_ORDER:
+    for cat in ['Suppe', 'Essen 1', 'Essen 2', 'Essen 3']:
         if cat in seen_cats:
             d = seen_cats[cat]
-            price = d.get('price','')
+            price = d.get('price', '')
             dishes.append({
                 'kategorie': cat,
                 'name':      d['name'],
                 'preis_int': price + ' \u20ac' if price else '',
-                'vv':        d.get('vv','')
+                'vv':        d.get('vv', '')
             })
     print(f"    -> {strategy}: {[d['name'][:28] for d in dishes]}")
     return dishes
 
-
-# ── Render ──────────────────────────────────────────────────────────────────────
+# ── Render ────────────────────────────────────────────────────────────────────
 def wrap_text(draw, text, f, max_w):
     out2, cur2 = [], ''
     for w in text.split():
@@ -385,7 +391,7 @@ def _footer(d,kw,label,local_dt,f,source=''):
     b=d.textbbox((0,0),txt,font=f)
     d.text(((W-(b[2]-b[0]))//2,H-16),txt,font=f,fill=WHITE)
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     now   = datetime.now(timezone.utc)
     local = german_time(now)
@@ -403,8 +409,6 @@ def main():
     print(f'Lade {len(open_dates)} Tage einzeln...')
 
     week_data = {}
-    strategies_used = set()
-
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
         page = browser.new_page(
@@ -418,13 +422,13 @@ def main():
                 week_data[dk] = dishes
         browser.close()
 
-    print(f'Ergebnis: {list(week_data.keys())}')
     days_filled = len(week_data)
     days_open   = len(open_dates)
-    source = f'DOM ({days_filled}/{days_open} Tage)'
+    print(f'Ergebnis: {list(week_data.keys())}  ({days_filled}/{days_open} Tage)')
 
     img = render(week_data, kw, label, local,
-                 URL_BASE, holiday_map, source)
+                 URL_BASE, holiday_map,
+                 f'DOM ({days_filled}/{days_open} Tage)')
     img.save(str(out_path), 'JPEG', quality=92)
     print(f'Saved: {out_path}  ({img.size[0]}x{img.size[1]})')
 
