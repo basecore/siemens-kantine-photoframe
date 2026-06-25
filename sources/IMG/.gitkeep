@@ -1,0 +1,5 @@
+# Hardware-Fotos
+# frame.jpg und router.jpg sind identisch mit basecore/kicktipp-photoframe – siehe dort unter sources/IMG/
+# Zum lokalen Kopieren:
+#   curl -L https://raw.githubusercontent.com/basecore/kicktipp-photoframe/main/sources/IMG/frame.jpg  -o sources/IMG/frame.jpg
+#   curl -L https://raw.githubusercontent.com/basecore/kicktipp-photoframe/main/sources/IMG/router.jpg -o sources/IMG/router.jpg
