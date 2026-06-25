@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
-"""Siemens Kantine Regensburg – DOM-based menu scraper + 800x600 JPEG renderer.
+"""Siemens Kantine Regensburg – DOM scraper + 800x600 landscape JPEG.
 
-The menu data is rendered directly in the HTML by the SPA.
-After waiting for JS, BeautifulSoup extracts the visible text which contains:
-  Mon. 22.06. | Tue. 23.06. | ... dates ...
-  Soup/Starter | Food 1 | Food 2 | Food 3
-  dish name, allergen codes, Int €X.XX Ext €Y.YY
+HTML line structure (SPA, English UI):
+  ...noise...
+  Mon. / 22.06. / Tue. / 23.06. / ... / Fri. / 26.06.
+  Soup / Starter
+    Today's soup / Int / €0.60 / Ext / €1.20
+  Food 1
+    Pancake / Vanilla sauce / Cherry compote / A / G / Int / €3.20 / Ext / €6.40
+  Food 2
+    Pizza with salami / G / Int / €6.10 / Ext / €12.20
+    or
+    Vegetarian pizza / Int / €5.80 / Ext / €11.60
+    Fish / Paella Frutti di Mare / ... / Int / €5.90 / Ext / €11.80
+    ...
+
+Each category lists all 5 days sequentially.
+An 'Int / € X.XX' pair terminates one day's entry within a category block.
+Alternatives (line == 'or') are joined to the previous dish with ' / '.
 """
 import os
 import re
@@ -40,7 +52,6 @@ C_TXT  = ( 30,  30,  30)
 WHITE  = (255, 255, 255)
 GRID   = (200, 215, 230)
 
-# ── Fonts ───────────────────────────────────────────────────────────────────
 _FREG = ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
          "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"]
 _FBOL = ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -101,167 +112,182 @@ def load_page(url: str) -> str:
     print(f"  HTML size: {len(html):,} bytes")
     return html
 
-# ── Step 2: Parse DOM ───────────────────────────────────────────────────────────────
-CAT_PATTERNS = [
-    (r'Soup\s*/\s*Starter|Suppe',       'Suppe'),
-    (r'Food\s*1|Essen\s*1|Gericht\s*1', 'Essen 1'),
-    (r'Food\s*2|Essen\s*2|Gericht\s*2', 'Essen 2'),
-    (r'Food\s*3|Essen\s*3|Gericht\s*3', 'Essen 3'),
-]
-
-ALLERGEN_RE = re.compile(
-    r'\s+([A-H](?:\.[1-6])?(?:\s+[A-H](?:\.[1-6])?)*)\s*$'
-)
-PRICE_INT_RE = re.compile(r'Int\s*\u20ac?\s*(\d+[,.]\d{2})', re.I)
-PRICE_EXT_RE = re.compile(r'Ext\s*\u20ac?\s*(\d+[,.]\d{2})', re.I)
-VEGAN_RE     = re.compile(r'\bvegan\b', re.I)
-VEG_RE       = re.compile(r'\bvegetar', re.I)
-
-NOISE_WORDS = {
-    'int','ext','cw:','home','menu','stores','impressum','nutzungsbedingungen',
-    'datenschutzerklärung','close','english','lunch','this','website','uses',
-    'cookies','learn','more','got','it!','siemens','view_compact','place',
-    'menu','home','soup','starter','food','essen','gericht','suppe',
+# ── Step 2: Parse ─────────────────────────────────────────────────────────────────
+# Recognised category header lines
+CAT_HEADERS = {
+    'Soup / Starter': 'Suppe',
+    'Soup/Starter':   'Suppe',
+    'Soup':           'Suppe',
+    'Food 1':         'Essen 1',
+    'Food 2':         'Essen 2',
+    'Food 3':         'Essen 3',
+    'Essen 1':        'Essen 1',
+    'Essen 2':        'Essen 2',
+    'Essen 3':        'Essen 3',
+    'Gericht 1':      'Essen 1',
+    'Gericht 2':      'Essen 2',
+    'Gericht 3':      'Essen 3',
 }
 
-def detect_vv(text):
-    if VEGAN_RE.search(text): return 'VG'
-    if VEG_RE.search(text):   return 'V'
+# Lines to drop entirely (navigation, cookies, etc.)
+UI_NOISE = {
+    'This website uses cookies to ensure you get the best experience on our website.',
+    'Learn more', 'Got it!', 'Siemens | Menu', 'home', 'Home', 'view_compact',
+    'Menu', 'place', 'Stores', 'Impressum', 'Nutzungsbedingungen',
+    'Datenschutzerklärung', 'close', 'Close', 'English', 'menu', 'Lunch',
+    'filter_list', 'Filter', 'Store', 'clear', 'Info', 'New Webportal',
+    '- Siemens Gastronomie', 'Register now:', 'MyCasinoCard',
+    'Allergens and Additives', 'Please check the allergens and additives during opening hours',
+    'for further information', 'more information', 'List',
+    'Description of all allergens and additives', 'Opening hours',
+}
+
+INT_RE  = re.compile(r'^Int$', re.I)
+EXT_RE  = re.compile(r'^Ext$', re.I)
+PRIC_RE = re.compile(r'^[€$]\d')        # €0.60  €12.20
+DATE_RE = re.compile(r'^\d{2}\.\d{2}\.$') # 22.06.
+DAY_RE  = re.compile(r'^(Mon|Tue|Wed|Thu|Fri|Mo|Di|Mi|Do|Fr)\.?$')
+CW_RE   = re.compile(r'^CW:\s*\d+$')
+ALLG_RE = re.compile(r'^[A-H](\.[1-6])?$') # single allergen token
+OR_RE   = re.compile(r'^(or|oder)$', re.I)
+VEGAN_RE= re.compile(r'\bvegan\b', re.I)
+VEG_RE  = re.compile(r'\bvegetar', re.I)
+
+def is_noise(line: str) -> bool:
+    if line in UI_NOISE: return True
+    if DATE_RE.match(line): return True
+    if DAY_RE.match(line):  return True
+    if CW_RE.match(line):   return True
+    if INT_RE.match(line):  return True
+    if EXT_RE.match(line):  return True
+    if PRIC_RE.match(line): return True
+    if ALLG_RE.match(line): return True
+    if OR_RE.match(line):   return True
+    if re.match(r'^Lunch \|', line): return True
+    if re.match(r'^\d+$', line): return True
+    return False
+
+def detect_vv(tokens: list) -> str:
+    txt = ' '.join(tokens)
+    if VEGAN_RE.search(txt): return 'VG'
+    if VEG_RE.search(txt):   return 'V'
     return ''
 
-def strip_allergens(name):
-    return ALLERGEN_RE.sub('', name).strip()
+def extract_int_price(tokens: list) -> str:
+    """
+    Scan the token stream for  Int \u20acX.XX  and return 'X.XX €'.
+    Tokens arrive as individual lines, so 'Int' and '€X.XX' are consecutive items.
+    """
+    for i, tok in enumerate(tokens):
+        if INT_RE.match(tok) and i+1 < len(tokens) and PRIC_RE.match(tokens[i+1]):
+            return tokens[i+1].lstrip('€$') + ' €'
+    return ''
 
 def parse_dom(html: str, local_dt: datetime) -> dict:
     monday    = local_dt - timedelta(days=local_dt.weekday())
     dates     = [(monday + timedelta(days=i)).strftime('%d.%m') for i in range(5)]
-    day_short = ['Mo','Di','Mi','Do','Fr']
+    day_short = ['Mo', 'Di', 'Mi', 'Do', 'Fr']
+    day_keys  = [f"{day_short[i]} {dates[i]}" for i in range(5)]
 
     soup = BeautifulSoup(html, 'html.parser')
-
-    # --- Strategy A: find day-column containers by date string ---
-    day_cols = {}
-    for i, date in enumerate(dates):
-        for el in soup.find_all(string=re.compile(re.escape(date))):
-            parent = el.find_parent(['td','th','div','section','article','li'])
-            if parent and date not in str(day_cols):
-                day_key = f"{day_short[i]} {date}"
-                day_cols[day_key] = parent
-                print(f"  Day col [{day_key}]: <{parent.name} class={parent.get('class','')}>"),
-                break
-
-    if len(day_cols) >= 3:
-        print(f"  Strategy A: {len(day_cols)} columns found")
-        return _parse_columns(day_cols)
-
-    # --- Strategy B: line-by-line flat text ---
-    print("  Strategy B: flat text")
-    return _parse_flat(soup, dates, day_short)
-
-
-def _parse_columns(day_cols: dict) -> dict:
-    week_data = {}
-    for day_key, col_el in day_cols.items():
-        col_text = col_el.get_text(' ', strip=True)
-        print(f"  [{day_key}] text: {col_text[:180]}")
-        meals = []
-        for cat_re, cat_label in CAT_PATTERNS:
-            m = re.search(cat_re, col_text, re.I)
-            if not m: continue
-            rest = col_text[m.end():]
-            # Cut before next category
-            nc = re.search(r'(?:Food\s*[123]|Essen\s*[123]|Soup|Suppe)', rest, re.I)
-            seg = rest[:nc.start()] if nc else rest[:300]
-            # Extract int price
-            pm = PRICE_INT_RE.search(seg)
-            price = pm.group(1) + ' €' if pm else ''
-            # Name: everything before price / allergen block
-            name_raw = seg[:pm.start()] if pm else seg
-            name = strip_allergens(
-                re.sub(r'\s+', ' ', re.sub(r'Int\s*€.*', '', name_raw)).strip()
-            )
-            if name and len(name) >= 3:
-                meals.append({
-                    'kategorie': cat_label, 'name': name,
-                    'vv': detect_vv(seg), 'preis_int': price,
-                })
-        if meals:
-            week_data[day_key] = meals
-    return week_data
-
-
-def _parse_flat(soup, dates, day_short) -> dict:
-    for tag in soup(['script','style','noscript']): tag.decompose()
+    for tag in soup(['script', 'style', 'noscript']): tag.decompose()
     lines = [l.strip() for l in soup.get_text('\n').splitlines() if l.strip()]
-    print(f"  Lines total: {len(lines)}")
-    print("  Lines 0-80:")
-    for i, l in enumerate(lines[:80]):
-        print(f"    {i:3d}: {l[:100]}")
 
-    # Locate date lines
-    day_idx = {}
-    for i, date in enumerate(dates):
-        for li, line in enumerate(lines):
-            if date in line:
-                day_idx[i] = li
-                print(f"  Date {date} at line {li}: {line!r}")
-                break
+    print(f"  Total lines: {len(lines)}")
 
-    if not day_idx:
-        print("  No dates found!")
+    # Find where the actual menu starts (after 'Soup / Starter' or first category)
+    menu_start = None
+    for i, line in enumerate(lines):
+        if line in CAT_HEADERS:
+            menu_start = i
+            break
+    if menu_start is None:
+        print("  ERROR: no category header found")
         return {}
+    print(f"  Menu starts at line {menu_start}: {lines[menu_start]!r}")
 
-    # Locate category lines
-    cat_idx = {}
-    after = min(day_idx.values()) + 3
-    for li in range(after, len(lines)):
-        for cat_re, cat_label in CAT_PATTERNS:
-            if re.search(cat_re, lines[li], re.I) and cat_label not in cat_idx:
-                cat_idx[cat_label] = li
-                print(f"  Cat '{cat_label}' at line {li}: {lines[li]!r}")
+    # Split lines into category blocks
+    # Each block: [ (cat_label, [lines...]), ... ]
+    blocks = []   # list of (cat_label, raw_lines)
+    cur_cat   = None
+    cur_lines = []
+    for line in lines[menu_start:]:
+        if line in CAT_HEADERS:
+            if cur_cat is not None:
+                blocks.append((cur_cat, cur_lines))
+            cur_cat   = CAT_HEADERS[line]
+            cur_lines = []
+        elif cur_cat is not None:
+            cur_lines.append(line)
+    if cur_cat:
+        blocks.append((cur_cat, cur_lines))
 
-    print(f"  day_idx={day_idx}  cat_idx={cat_idx}")
+    print(f"  Category blocks found: {[b[0] for b in blocks]}")
 
-    week_data = {f"{day_short[i]} {dates[i]}": [] for i in range(5)}
-    cats_sorted = sorted(cat_idx.items(), key=lambda x: x[1])
+    # For each block, split into exactly 5 day-dishes.
+    # Delimiter between days: the 'Int' token (followed by price).
+    # We walk the lines; when we see 'Int' followed by '€X' we close the current dish.
+    week_data = {k: [] for k in day_keys}
 
-    for ci, (cat_label, cat_li) in enumerate(cats_sorted):
-        end_li = cats_sorted[ci+1][1] if ci+1 < len(cats_sorted) else min(cat_li+60, len(lines))
-        block  = lines[cat_li+1:end_li]
-        print(f"  {cat_label} block ({len(block)} lines): {block[:15]}")
+    for cat_label, raw in blocks:
+        print(f"  Parsing {cat_label} ({len(raw)} raw lines): {raw[:20]}")
+        dishes = []     # list of {name, price, vv}
+        cur_toks = []   # name tokens for current day's dish
+        i = 0
+        while i < len(raw):
+            tok = raw[i]
+            # Int €X.XX -> close dish
+            if INT_RE.match(tok) and i+1 < len(raw) and PRIC_RE.match(raw[i+1]):
+                price = raw[i+1].lstrip('€$') + ' €'
+                name_toks = [t for t in cur_toks if not ALLG_RE.match(t) and not OR_RE.match(t)]
+                name = ' '.join(name_toks).strip()
+                if name:
+                    dishes.append({
+                        'name':      name,
+                        'preis_int': price,
+                        'vv':        detect_vv(cur_toks),
+                    })
+                cur_toks = []
+                i += 2  # skip €X.XX
+                # also skip Ext €X.XX if next
+                if i < len(raw) and EXT_RE.match(raw[i]):
+                    i += 1
+                    if i < len(raw) and PRIC_RE.match(raw[i]):
+                        i += 1
+                continue
+            # Skip Ext price tokens
+            if EXT_RE.match(tok):
+                i += 1
+                if i < len(raw) and PRIC_RE.match(raw[i]): i += 1
+                continue
+            # Stop at next category header or known end marker
+            if tok in CAT_HEADERS or tok in UI_NOISE:
+                break
+            # Skip allergen tokens and 'or'/'oder' as content (keep rest)
+            if not ALLG_RE.match(tok):
+                cur_toks.append(tok)
+            i += 1
 
-        # Collect dish groups separated by Int € price tokens
-        dishes = []; cur = []; cur_price = ''
-        for tok in block:
-            pm = PRICE_INT_RE.search(tok)
-            if pm:
-                cur_price = pm.group(1) + ' €'
-                name = strip_allergens(' '.join(cur))
-                if name and len(name) >= 3:
-                    dishes.append((name, cur_price, detect_vv(' '.join(cur))))
-                cur = []; cur_price = ''
-            elif PRICE_EXT_RE.match(tok):
-                pass  # skip ext price
-            elif tok.lower() not in NOISE_WORDS and not re.match(r'^[€\d,. ]+$', tok):
-                cur.append(tok)
-        if cur:
-            name = strip_allergens(' '.join(cur))
-            if name and len(name) >= 3:
-                dishes.append((name, cur_price, detect_vv(' '.join(cur))))
+        # flush last dish if no trailing Int price
+        if cur_toks:
+            name_toks = [t for t in cur_toks if not ALLG_RE.match(t) and not OR_RE.match(t)]
+            name = ' '.join(name_toks).strip()
+            if name:
+                dishes.append({'name': name, 'preis_int': '', 'vv': detect_vv(cur_toks)})
 
-        print(f"  {cat_label}: {[(n[:40],p) for n,p,_ in dishes]}")
+        print(f"    -> {len(dishes)} dishes: {[(d['name'][:35], d['preis_int']) for d in dishes]}")
 
-        for di in range(5):
+        # Assign dishes to days (index 0=Mo, 1=Di, ...)
+        for di, day_key in enumerate(day_keys):
             if di < len(dishes):
-                name, price, vv = dishes[di]
-                week_data[f"{day_short[di]} {dates[di]}"].append({
-                    'kategorie': cat_label, 'name': name,
-                    'vv': vv, 'preis_int': price,
+                week_data[day_key].append({
+                    'kategorie': cat_label,
+                    **dishes[di],
                 })
 
     return {k: v for k, v in week_data.items() if v}
 
-# ── Render 800x600 JPEG ──────────────────────────────────────────────────────────────
+# ── Render 800x600 landscape JPEG ───────────────────────────────────────────────────
 def wrap_text(draw, text, f, max_w):
     words = text.split()
     out, cur = [], ''
@@ -275,86 +301,90 @@ def wrap_text(draw, text, f, max_w):
     if cur: out.append(cur)
     return out
 
-CATS = ['Suppe','Essen 1','Essen 2','Essen 3']
+CATS = ['Suppe', 'Essen 1', 'Essen 2', 'Essen 3']
 
 def render(week_data, kw, label, local_dt, url_menu):
-    img = Image.new('RGB',(W,H),(255,255,255))
+    img = Image.new('RGB', (W,H), (255,255,255))
     d   = ImageDraw.Draw(img)
     ftit=lf(14,True); fday=lf(11,True); fcat=lf(8,True)
-    ftxt=lf(9); fbdg=lf(8,True); fprc=lf(8); fftr=lf(9)
+    ftxt=lf(9);       fbdg=lf(8,True);  fprc=lf(8); fftr=lf(9)
     HDR_H=36; LEGEND_H=17
 
-    d.rectangle([(0,0),(W,HDR_H)],fill=BLUE)
-    title=f'Siemens Kantine Regensburg  |  KW {kw:02d}'
-    b=d.textbbox((0,0),title,font=ftit)
-    d.text(((W-(b[2]-b[0]))//2,(HDR_H-(b[3]-b[1]))//2),title,font=ftit,fill=WHITE)
-    y=HDR_H
+    # Header
+    d.rectangle([(0,0),(W,HDR_H)], fill=BLUE)
+    title = f'Siemens Kantine Regensburg  |  KW {kw:02d}'
+    b = d.textbbox((0,0), title, font=ftit)
+    d.text(((W-(b[2]-b[0]))//2, (HDR_H-(b[3]-b[1]))//2), title, font=ftit, fill=WHITE)
+    y = HDR_H
 
     if not week_data:
-        d.text((20,y+40),'Speiseplan konnte nicht geladen werden.',font=ftxt,fill=C_TXT)
-        d.text((20,y+60),'Bitte manuell pr\u00fcfen:',font=ftxt,fill=C_TXT)
-        d.text((20,y+80),url_menu,font=ftxt,fill=LIGHT)
-        _footer(d,kw,label,local_dt,fftr); return img
+        d.text((20,y+40), 'Speiseplan konnte nicht geladen werden.', font=ftxt, fill=C_TXT)
+        d.text((20,y+60), 'Bitte manuell prüfen:', font=ftxt, fill=C_TXT)
+        d.text((20,y+80), url_menu, font=ftxt, fill=LIGHT)
+        _footer(d, kw, label, local_dt, fftr)
+        return img
 
-    days=list(week_data.keys())[:5]
-    dw=W//len(days); DAY_H=20
-    for i,day in enumerate(days):
-        x=i*dw
-        d.rectangle([(x,y),(x+dw-1,y+DAY_H-1)],fill=LIGHT)
-        b=d.textbbox((0,0),day,font=fday)
-        d.text((x+(dw-(b[2]-b[0]))//2,y+(DAY_H-(b[3]-b[1]))//2),day,font=fday,fill=WHITE)
-        if i>0: d.line([(x,y),(x,y+DAY_H)],fill=BLUE,width=1)
-    y+=DAY_H
+    days = list(week_data.keys())[:5]
+    dw   = W // len(days)
+    DAY_H = 20
+    for i, day in enumerate(days):
+        x = i*dw
+        d.rectangle([(x,y),(x+dw-1,y+DAY_H-1)], fill=LIGHT)
+        b = d.textbbox((0,0), day, font=fday)
+        d.text((x+(dw-(b[2]-b[0]))//2, y+(DAY_H-(b[3]-b[1]))//2), day, font=fday, fill=WHITE)
+        if i>0: d.line([(x,y),(x,y+DAY_H)], fill=BLUE, width=1)
+    y += DAY_H
 
-    avail=H-y-FOOTER_H-LEGEND_H-2
-    rs=int(avail*0.20); re_=(avail-rs)//3
-    ROW_H={'Suppe':rs,'Essen 1':re_,'Essen 2':re_,'Essen 3':avail-rs-2*re_}
+    avail = H - y - FOOTER_H - LEGEND_H - 2
+    rs    = int(avail * 0.20)
+    re_   = (avail - rs) // 3
+    ROW_H = {'Suppe': rs, 'Essen 1': re_, 'Essen 2': re_, 'Essen 3': avail-rs-2*re_}
 
-    for ri,cat in enumerate(CATS):
-        rh=ROW_H[cat]
-        d.rectangle([(0,y),(W,y+rh-1)],fill=R_ODD if ri%2==0 else R_EVEN)
-        d.line([(0,y),(W,y)],fill=GRID,width=1)
-        for i,day in enumerate(days):
-            x=i*dw
-            if i>0: d.line([(x,y),(x,y+rh)],fill=GRID,width=1)
-            items=[it for it in week_data.get(day,[]) if it['kategorie']==cat]
+    for ri, cat in enumerate(CATS):
+        rh = ROW_H[cat]
+        d.rectangle([(0,y),(W,y+rh-1)], fill=R_ODD if ri%2==0 else R_EVEN)
+        d.line([(0,y),(W,y)], fill=GRID, width=1)
+        for i, day in enumerate(days):
+            x = i*dw
+            if i>0: d.line([(x,y),(x,y+rh)], fill=GRID, width=1)
+            items = [it for it in week_data.get(day,[]) if it['kategorie']==cat]
             if not items:
-                b=d.textbbox((0,0),'-',font=ftxt)
-                d.text((x+(dw-(b[2]-b[0]))//2,y+rh//2-6),'-',font=ftxt,fill=(180,180,180))
+                b = d.textbbox((0,0), '-', font=ftxt)
+                d.text((x+(dw-(b[2]-b[0]))//2, y+rh//2-6), '-', font=ftxt, fill=(180,180,180))
                 continue
-            it=items[0]; cx=x+4; cy=y+3; avw=dw-8
-            d.text((cx,cy),it['kategorie'],font=fcat,fill=(100,100,100)); cy+=10
+            it = items[0]; cx = x+4; cy = y+3; avw = dw-8
+            d.text((cx,cy), it['kategorie'], font=fcat, fill=(100,100,100)); cy += 10
             if it['vv']:
-                bl='Vegan' if it['vv']=='VG' else 'Veg.'
-                bc=C_VG if it['vv']=='VG' else C_V
-                b=d.textbbox((0,0),bl,font=fbdg)
-                bw=b[2]-b[0]+5; bh=b[3]-b[1]+3
-                d.rounded_rectangle([(cx,cy),(cx+bw,cy+bh)],radius=3,fill=bc)
-                d.text((cx+3,cy+1),bl,font=fbdg,fill=WHITE); cy+=bh+2
-            for ln in wrap_text(d,it['name'],ftxt,avw)[:3]:
-                d.text((cx,cy),ln,font=ftxt,fill=C_TXT); cy+=11
+                bl = 'Vegan' if it['vv']=='VG' else 'Veg.'
+                bc = C_VG   if it['vv']=='VG' else C_V
+                b  = d.textbbox((0,0), bl, font=fbdg)
+                bw = b[2]-b[0]+5; bh = b[3]-b[1]+3
+                d.rounded_rectangle([(cx,cy),(cx+bw,cy+bh)], radius=3, fill=bc)
+                d.text((cx+3,cy+1), bl, font=fbdg, fill=WHITE); cy += bh+2
+            for ln in wrap_text(d, it['name'], ftxt, avw)[:3]:
+                d.text((cx,cy), ln, font=ftxt, fill=C_TXT); cy += 11
             if it['preis_int']:
-                pl=f"Int: {it['preis_int']}"
-                b=d.textbbox((0,0),pl,font=fprc)
-                d.text((x+dw-(b[2]-b[0])-3,y+rh-(b[3]-b[1])-3),pl,font=fprc,fill=LIGHT)
-        y+=rh
+                pl = f"Int: {it['preis_int']}"
+                b  = d.textbbox((0,0), pl, font=fprc)
+                d.text((x+dw-(b[2]-b[0])-3, y+rh-(b[3]-b[1])-3), pl, font=fprc, fill=LIGHT)
+        y += rh
 
-    d.line([(0,y),(W,y)],fill=GRID,width=1); y+=1
-    d.rectangle([(0,y),(W,y+LEGEND_H)],fill=(245,249,253))
-    d.rectangle([( 5,y+4),(15,y+13)],fill=C_VG)
-    d.text((19,y+3),'Vegan',font=fprc,fill=C_TXT)
-    d.rectangle([(65,y+4),(75,y+13)],fill=C_V)
-    d.text((79,y+3),'Vegetarisch',font=fprc,fill=C_TXT)
-    d.text((175,y+3),'Int = Mitarbeiterpreis',font=fprc,fill=(120,120,120))
-    _footer(d,kw,label,local_dt,fftr)
+    d.line([(0,y),(W,y)], fill=GRID, width=1); y += 1
+    d.rectangle([(0,y),(W,y+LEGEND_H)], fill=(245,249,253))
+    d.rectangle([( 5,y+4),(15,y+13)], fill=C_VG)
+    d.text((19,y+3), 'Vegan',        font=fprc, fill=C_TXT)
+    d.rectangle([(65,y+4),(75,y+13)], fill=C_V)
+    d.text((79,y+3), 'Vegetarisch',  font=fprc, fill=C_TXT)
+    d.text((175,y+3),'Int = Mitarbeiterpreis', font=fprc, fill=(120,120,120))
+    _footer(d, kw, label, local_dt, fftr)
     return img
 
-def _footer(d,kw,label,local_dt,f):
-    txt=(f'KW {kw:02d} / {label}  \u2013  '
-         f"{local_dt.strftime('%d.%m.%Y %H:%M Uhr')}  \u2013  siemens.cateringportal.io")
-    d.rectangle([(0,H-FOOTER_H),(W,H)],fill=BLUE)
-    b=d.textbbox((0,0),txt,font=f)
-    d.text(((W-(b[2]-b[0]))//2,H-16),txt,font=f,fill=WHITE)
+def _footer(d, kw, label, local_dt, f):
+    txt = (f'KW {kw:02d} / {label}  –  '
+           f"{local_dt.strftime('%d.%m.%Y %H:%M Uhr')}  –  siemens.cateringportal.io")
+    d.rectangle([(0,H-FOOTER_H),(W,H)], fill=BLUE)
+    b = d.textbbox((0,0), txt, font=f)
+    d.text(((W-(b[2]-b[0]))//2, H-16), txt, font=f, fill=WHITE)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
