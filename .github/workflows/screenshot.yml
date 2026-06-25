@@ -25,7 +25,7 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -yq chromium-browser fonts-dejavu curl
-          pip install playwright Pillow requests pdfplumber pypdf
+          pip install playwright Pillow requests pdfplumber pypdf beautifulsoup4 lxml
           python -m playwright install chromium
           python -m playwright install-deps chromium
 

@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
-"""Siemens Kantine Regensburg – weekly menu PDF scraper + 800x600 JPEG renderer."""
+"""Siemens Kantine Regensburg – weekly menu PDF scraper + 800x600 JPEG renderer.
+
+Strategy:
+  1. Open cateringportal.io with Playwright
+  2. Intercept ALL network responses to catch the qnips PDF URL
+     (the link is not in the HTML but loaded dynamically via JS/API)
+  3. Download the weekly PDF with requests
+  4. Parse menu items from PDF text (dedup + price-pair splitting)
+  5. Render clean 800x600 LANDSCAPE JPEG with Pillow
+"""
 import os
 import re
 import io
 import requests
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+from bs4 import BeautifulSoup
 
 from playwright.sync_api import sync_playwright
 from PIL import Image, ImageDraw, ImageFont
@@ -29,7 +39,7 @@ _SID = os.environ.get("CATERINGPORTAL_SID", "").strip()
 OUT_DIR  = Path("docs/images")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 MAX_KEEP = 8
-W, H = 800, 600   # landscape
+W, H = 800, 600
 FOOTER_H = 22
 
 # ── Colours ─────────────────────────────────────────────────────────────────
@@ -77,96 +87,94 @@ def kw_label(dt):
     y, w, _ = d.isocalendar()
     return f"{y}-W{w:02d}", int(w)
 
-# ── Step 1: Load HTML with Playwright (SPA-aware) ────────────────────────────
-def load_html(url: str) -> str:
+# ── Step 1: Load page, intercept ALL responses for qnips PDF ────────────────────
+def load_page(url: str) -> tuple:
+    """
+    Returns (html, pdf_url_or_None).
+    Intercepts every network response URL to catch qnips PDF links
+    that are set dynamically via JS/API and never appear in the HTML source.
+    """
+    found_pdf = []
+    found_api_json = []
+
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page(
+        context = browser.new_context(
             viewport={"width": 1280, "height": 900},
             extra_http_headers={"Accept-Language": "de-DE,de;q=0.9"},
         )
-        # Intercept and log PDF links as they are requested
-        pdf_urls_seen = []
-        def on_request(req):
-            if '.pdf' in req.url.lower():
-                print(f"  [network] PDF request: {req.url[:120]}")
-                pdf_urls_seen.append(req.url)
-        page.on("request", on_request)
+        page = context.new_page()
 
+        # Intercept every request URL
+        def on_request(req):
+            u = req.url
+            if 'qnips' in u.lower():
+                print(f"  [req] qnips: {u[:140]}")
+            if '.pdf' in u.lower() and 'allergen' not in u.lower():
+                print(f"  [req] PDF: {u[:140]}")
+                found_pdf.append(u)
+
+        # Intercept every response to also catch JSON API payloads
+        def on_response(resp):
+            u = resp.url
+            if 'qnips' in u.lower():
+                print(f"  [resp] qnips: {u[:140]}")
+                # Try to extract PDF URL from JSON response body
+                ct = resp.headers.get('content-type', '')
+                if 'json' in ct or 'text' in ct:
+                    try:
+                        body = resp.text()
+                        # find any qnips or Mittagessen PDF URL in the body
+                        urls = re.findall(
+                            r'https://files\.qnips\.com/[^\s"\'\'<>]+\.pdf[^\s"\'\'<>]*',
+                            body, re.I
+                        )
+                        if urls:
+                            print(f"  [resp-body] PDF URLs: {urls[:3]}")
+                            found_pdf.extend(urls)
+                        else:
+                            # Dump first 300 chars of body for debug
+                            print(f"  [resp-body] (first 300): {body[:300]}")
+                        found_api_json.append((u, body[:2000]))
+                    except Exception as e:
+                        print(f"  [resp-body] error reading body: {e}")
+
+        page.on("request",  on_request)
+        page.on("response", on_response)
+
+        print(f"  Navigating to {url}")
         page.goto(url, wait_until="load", timeout=60000)
 
-        # Wait for SPA to fully render: look for qnips link OR dish-like text
-        print("  Waiting for SPA content...")
-        for selector in [
-            "a[href*='qnips']",
-            "a[href*='.pdf']",
-            "[class*='menu']",
-            "[class*='dish']",
-            "[class*='meal']",
-            "main",
-        ]:
-            try:
-                page.wait_for_selector(selector, timeout=8000, state="attached")
-                print(f"  Selector matched: {selector}")
-                break
-            except Exception:
-                pass
-
-        # Extra wait for JS-rendered content
-        page.wait_for_timeout(5000)
-        print(f"  Final title: {page.title()}")
+        # Wait longer for SPA + API calls to complete
+        print("  Waiting 8s for API calls...")
+        page.wait_for_timeout(8000)
+        print(f"  Title: {page.title()}")
 
         html = page.content()
         browser.close()
 
     print(f"  HTML size: {len(html):,} bytes")
-    print(f"  PDF URLs seen in network: {pdf_urls_seen}")
+    print(f"  PDF URLs intercepted: {found_pdf}")
 
-    # Debug: show all href containing 'pdf' or 'qnips'
-    pdf_hrefs = re.findall(r'href=["\']([^"\'>]*(?:pdf|qnips)[^"\'>]*)["\']', html, re.I)
-    print(f"  PDF/qnips hrefs in HTML ({len(pdf_hrefs)}):")
-    for h in pdf_hrefs[:10]:
-        print(f"    {h[:120]}")
+    # Also search raw HTML for any qnips URL
+    html_pdfs = re.findall(
+        r'https://files\.qnips\.com/[^\s"\'\'<>]+\.pdf[^\s"\'\'<>]*',
+        html, re.I
+    )
+    if html_pdfs:
+        print(f"  qnips PDFs in HTML: {html_pdfs[:5]}")
+        found_pdf.extend(html_pdfs)
 
-    # Also show first 2000 chars of body text for debugging
-    from bs4 import BeautifulSoup
+    # Debug: show visible body text
     soup = BeautifulSoup(html, 'html.parser')
-    for tag in soup(['script','style','noscript']):
-        tag.decompose()
-    body_text = ' '.join(soup.get_text(' ').split())
-    print(f"  Body text preview (first 500 chars): {body_text[:500]}")
+    for tag in soup(['script','style','noscript']): tag.decompose()
+    body_txt = ' '.join(soup.get_text(' ').split())
+    print(f"  Body text (500 chars): {body_txt[:500]}")
 
-    return html, pdf_urls_seen
+    pdf_url = found_pdf[0] if found_pdf else None
+    return html, pdf_url
 
-# ── Step 2: Find qnips PDF URL ────────────────────────────────────────────────────
-def find_pdf_url(html: str, network_urls: list, kw: int) -> str | None:
-    # 1. Check network-intercepted PDF URLs first (most reliable)
-    for url in network_urls:
-        if 'qnips' in url.lower() and 'mittagessen' in url.lower():
-            print(f"  PDF from network intercept: {url[:120]}")
-            return url
-
-    # 2. Search HTML for qnips Mittagessen PDF links
-    patterns = [
-        r'(https://files\.qnips\.com/release-menu-pdfs/Mittagessen[^"\s\'<>]+)',
-        r'(https://files\.qnips\.com/[^"\s\'<>]+Mittagessen[^"\s\'<>]+\.pdf[^"\s\'<>]*)',
-        r'(https?://[^"\s\'<>]*qnips[^"\s\'<>]*Mittagessen[^"\s\'<>]*\.pdf[^"\s\'<>]*)',
-        r'(https?://[^"\s\'<>]*qnips[^"\s\'<>]*\.pdf[^"\s\'<>]*)',
-    ]
-    for pat in patterns:
-        matches = re.findall(pat, html, re.I)
-        for url in matches:
-            if f'_{kw}_' in url or f'_DE_{kw}_' in url:
-                print(f"  PDF found (KW {kw} match): {url[:120]}")
-                return url
-        if matches:
-            print(f"  PDF found (first match): {matches[0][:120]}")
-            return matches[0]
-
-    print("  No qnips PDF URL found.")
-    return None
-
-# ── Step 3: Download PDF ─────────────────────────────────────────────────────────
+# ── Step 2: Download PDF ─────────────────────────────────────────────────────────
 def download_pdf(url: str) -> bytes:
     headers = {"User-Agent": "Mozilla/5.0 (compatible; KantinoBot/1.0)"}
     r = requests.get(url, headers=headers, timeout=30)
@@ -174,7 +182,7 @@ def download_pdf(url: str) -> bytes:
     print(f"  PDF downloaded: {len(r.content):,} bytes")
     return r.content
 
-# ── Step 4: Extract text from PDF ──────────────────────────────────────────────
+# ── Step 3: Extract text from PDF ─────────────────────────────────────────────
 def extract_pdf_text(pdf_bytes: bytes) -> str:
     if pdfplumber:
         try:
@@ -193,23 +201,23 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
         return text
     raise RuntimeError("No PDF parser available")
 
-# ── Step 5: Parse qnips column layout ─────────────────────────────────────────
-def dedup_text(text: str) -> str:
+# ── Step 4: Parse qnips column layout ─────────────────────────────────────────
+def dedup_text(text):
     for _ in range(6):
         text = re.sub(r'([A-Za-z\u00c0-\u017e,\- ]{4,})\1', r'\1', text)
     return text
 
-def fix_name(name: str) -> str:
+def fix_name(name):
     name = re.sub(r'([a-z\u00e0-\u017e])([A-Z\u00c0-\u00de])', r'\1 \2', name)
     return re.sub(r'\s+', ' ', name).strip()
 
-def detect_vv(name: str) -> str:
+def detect_vv(name):
     low = name.lower()
     if 'vegan' in low: return 'VG'
     if 'vegetar' in low: return 'V'
     return ''
 
-def split_items(body: str) -> list:
+def split_items(body):
     parts = re.split(r'(?<=\d{2})  +(?=[A-Z\u00c0-\u00de])', body)
     result = []
     for part in parts:
@@ -226,15 +234,15 @@ def split_items(body: str) -> list:
             price = ''
         if not name or len(name) < 3: continue
         low = name.lower()
-        skip = ['oder','int','ext','int.ext','mo - fr','alle preise','all prices',
+        skip = ['oder','int.ext','mo - fr','alle preise','all prices',
                 'restaurant','thomas','+49','allergen','monday','tuesday']
         if any(low.startswith(w) for w in skip): continue
         if re.match(r'^[\d.,\s\u20ac/]+$', name): continue
         result.append((name, price))
     return result
 
-def parse_menu(pdf_text: str, local_dt: datetime) -> dict:
-    monday   = local_dt - timedelta(days=local_dt.weekday())
+def parse_menu(pdf_text, local_dt):
+    monday    = local_dt - timedelta(days=local_dt.weekday())
     day_labels = [f"{s} {(monday+timedelta(days=i)).strftime('%d.%m')}"
                   for i, s in enumerate(['Mo','Di','Mi','Do','Fr'])]
 
@@ -263,7 +271,7 @@ def parse_menu(pdf_text: str, local_dt: datetime) -> dict:
                 })
     return {k: v for k, v in week_data.items() if v}
 
-# ── Step 6: Render 800x600 landscape JPEG ───────────────────────────────────────
+# ── Step 5: Render 800x600 landscape JPEG ───────────────────────────────────────
 def wrap_text(draw, text, f, max_w):
     words = text.split()
     out, cur = [], ''
@@ -282,15 +290,15 @@ CATS = ['Suppe','Essen 1','Essen 2','Essen 3']
 def render(week_data, kw, label, local_dt, url_menu):
     img = Image.new('RGB',(W,H),(255,255,255))
     d   = ImageDraw.Draw(img)
-    ftit = lf(14,True); fday = lf(11,True); fcat = lf(8,True)
-    ftxt = lf(9); fbdg = lf(8,True); fprc = lf(8); fftr = lf(9)
-
+    ftit=lf(14,True); fday=lf(11,True); fcat=lf(8,True)
+    ftxt=lf(9); fbdg=lf(8,True); fprc=lf(8); fftr=lf(9)
     HDR_H=36; LEGEND_H=17
+
     d.rectangle([(0,0),(W,HDR_H)],fill=BLUE)
-    title = f'Siemens Kantine Regensburg  |  KW {kw:02d}'
-    b = d.textbbox((0,0),title,font=ftit)
+    title=f'Siemens Kantine Regensburg  |  KW {kw:02d}'
+    b=d.textbbox((0,0),title,font=ftit)
     d.text(((W-(b[2]-b[0]))//2,(HDR_H-(b[3]-b[1]))//2),title,font=ftit,fill=WHITE)
-    y = HDR_H
+    y=HDR_H
 
     if not week_data:
         d.text((20,y+40),'Speiseplan konnte nicht geladen werden.',font=ftxt,fill=C_TXT)
@@ -298,9 +306,8 @@ def render(week_data, kw, label, local_dt, url_menu):
         d.text((20,y+80),url_menu,font=ftxt,fill=LIGHT)
         _footer(d,kw,label,local_dt,fftr); return img
 
-    days = list(week_data.keys())[:5]
-    dw   = W // len(days)
-    DAY_H = 20
+    days=list(week_data.keys())[:5]
+    dw=W//len(days); DAY_H=20
     for i,day in enumerate(days):
         x=i*dw
         d.rectangle([(x,y),(x+dw-1,y+DAY_H-1)],fill=LIGHT)
@@ -309,9 +316,8 @@ def render(week_data, kw, label, local_dt, url_menu):
         if i>0: d.line([(x,y),(x,y+DAY_H)],fill=BLUE,width=1)
     y+=DAY_H
 
-    avail = H-y-FOOTER_H-LEGEND_H-2
-    rs = int(avail*0.20)
-    re_ = (avail-rs)//3
+    avail=H-y-FOOTER_H-LEGEND_H-2
+    rs=int(avail*0.20); re_=(avail-rs)//3
     ROW_H={'Suppe':rs,'Essen 1':re_,'Essen 2':re_,'Essen 3':avail-rs-2*re_}
 
     for ri,cat in enumerate(CATS):
@@ -367,41 +373,37 @@ def main():
     label, kw = kw_label(now)
     out_path  = OUT_DIR / f'kantine_{label}.jpg'
 
-    # Use date-specific URL so the SPA loads current week's content
-    date_str  = local.strftime('%Y-%m-%d')
-    url_menu  = f"{URL_BASE}/date/{date_str}"
-    if _SID:
-        url_menu += f"?ste_sid={_SID}"
+    date_str = local.strftime('%Y-%m-%d')
+    url_menu = f"{URL_BASE}/date/{date_str}"
+    if _SID: url_menu += f"?ste_sid={_SID}"
 
     print(f'Target URL : {url_menu}')
     print(f'Week label : {label}  (KW {kw:02d})')
 
-    # 1. Load HTML
+    # 1. Load page + intercept network
     print('Loading page...')
-    html, network_pdfs = load_html(url_menu)
+    html, pdf_url = load_page(url_menu)
 
-    # 2. Find PDF URL
-    pdf_url = find_pdf_url(html, network_pdfs, kw)
     if not pdf_url:
         print('ERROR: No qnips PDF found -> placeholder.')
         img = render({}, kw, label, local, url_menu)
         img.save(str(out_path), 'JPEG', quality=92)
         return
 
-    # 3. Download PDF
-    print('Downloading PDF...')
+    # 2. Download PDF
+    print(f'Downloading PDF: {pdf_url[:100]}...')
     pdf_bytes = download_pdf(pdf_url)
 
-    # 4. Extract text
+    # 3. Extract text
     print('Extracting PDF text...')
     pdf_text = extract_pdf_text(pdf_bytes)
 
-    # 5. Parse menu
+    # 4. Parse
     print('Parsing menu...')
     week_data = parse_menu(pdf_text, local)
     print(f'Days parsed: {list(week_data.keys())}')
 
-    # 6. Render
+    # 5. Render
     img = render(week_data, kw, label, local, url_menu)
     img.save(str(out_path), 'JPEG', quality=92)
     print(f'Saved: {out_path}  ({img.size[0]}x{img.size[1]})')
