@@ -18,13 +18,13 @@ Nachfolger von [kicktipp-photoframe](https://github.com/basecore/kicktipp-photof
 
 ### Philips 8FF3WMI Digital PhotoFrame
 
-![Philips 8FF3WMI Digital PhotoFrame](https://raw.githubusercontent.com/basecore/kicktipp-photoframe/3dced20f3089dd632787516a95a9d18826b24cb2/sources/IMG/frame.jpg)
+![Philips 8FF3WMI Digital PhotoFrame](https://github.com/basecore/siemens-kantine-photoframe/blob/0501a4b28e14bcf6f840445b591d8350d6f2768f/sources/IMG/frame.jpg)
 
 Der **Philips 8FF3WMI** ist ein digitaler Bilderrahmen, der RSS Feeds mit JPEG-Bildern über HTTP abrufen kann. Er unterstützt kein HTTPS – daher läuft das Hosting über bplaced.net. Das Ausgabeformat ist **800×600 px Querformat** (Landscape), passend zur horizontalen Wochentabelle des Cateringportals.
 
 ### Router: TP-Link TL-MR3020 mit 4G Stick & Netzclub SIM
 
-![TP-Link TL-MR3020 mit 4G Stick und Netzclub SIM](https://raw.githubusercontent.com/basecore/kicktipp-photoframe/3dced20f3089dd632787516a95a9d18826b24cb2/sources/IMG/router.jpg)
+![TP-Link TL-MR3020 mit 4G Stick und Netzclub SIM](https://github.com/basecore/siemens-kantine-photoframe/blob/0501a4b28e14bcf6f840445b591d8350d6f2768f/sources/IMG/router.jpg)
 
 Für die Internetverbindung des PhotoFrames kommt ein **TP-Link TL-MR3020** Reiserouter mit einem 4G USB-Stick und einer **Netzclub SIM-Karte (200 MB gratis)** zum Einsatz. Diese Kombination ermöglicht eine kostengünstige, autarke Netzwerkverbindung für den Bilderrahmen.
 
