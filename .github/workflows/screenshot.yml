@@ -8,11 +8,10 @@ on:
         required: false
         default: '1'
   schedule:
-    # täglich 00:00 UTC = 02:00 CEST (Sommer) / 01:00 CET (Winter)
-    # WEEK_OFFSET=0 → aktuelle Woche (verbleibende Tage)
+    # täglich 00:00 UTC = 02:00 CEST → aktuelle Woche (verbleibende Tage)
     - cron: '0 0 * * *'
-    # Do + Fr 14:00 UTC = 16:00 CEST → nächste Woche vorabladen
-    - cron: '0 14 * * 4,5'
+    # Freitag 10:00 UTC = 12:00 CEST → nächste Woche vorabladen
+    - cron: '0 10 * * 5'
 
 permissions:
   contents: write
@@ -33,11 +32,11 @@ jobs:
         id: offset
         run: |
           # workflow_dispatch: use input
-          # schedule 14:00 Thu/Fri: next week
-          # schedule 00:00 daily: current week
+          # Freitag 10:00 UTC: nächste Woche vorabladen
+          # alle anderen Läufe (00:00 UTC täglich): aktuelle Woche
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "WEEK_OFFSET=${{ github.event.inputs.week_offset }}" >> $GITHUB_ENV
-          elif [ "$(date -u +%H)" -ge 12 ]; then
+          elif [ "$(date -u +%u)" = "5" ] && [ "$(date -u +%H)" -ge 10 ] && [ "$(date -u +%H)" -lt 12 ]; then
             echo "WEEK_OFFSET=1" >> $GITHUB_ENV
           else
             echo "WEEK_OFFSET=0" >> $GITHUB_ENV
