@@ -25,12 +25,10 @@ from playwright.sync_api import sync_playwright
 from PIL import Image, ImageDraw, ImageFont
 
 # ── Config ────────────────────────────────────────────────────────────────────
-URL_BASE = os.environ.get(
-    "CATERINGPORTAL_URL",
-    "https://siemens.cateringportal.io/menu/Regensburg/Mittagessen",
-)
-_SID         = os.environ.get("CATERINGPORTAL_SID", "").strip()
-WEEK_OFFSET  = int(os.environ.get("WEEK_OFFSET", "0"))   # 0=current week, 1=next week
+URL_BASE    = os.environ.get("CATERINGPORTAL_URL",
+                              "https://siemens.cateringportal.io/menu/Regensburg/Mittagessen")
+_SID        = os.environ.get("CATERINGPORTAL_SID", "").strip()
+WEEK_OFFSET = int(os.environ.get("WEEK_OFFSET", "0"))
 
 OUT_DIR  = Path("docs/images")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -46,6 +44,8 @@ C_TXT = (30, 30, 30);   WHITE  = (255, 255, 255)
 GRID  = (190, 210, 230)
 C_HOL_BG  = (220, 220, 220); C_HOL_HDR = (140, 140, 140); C_HOL_TXT = (100, 100, 100)
 C_PAST_BG = (235, 235, 235); C_PAST_TXT = (160, 160, 160)
+C_TODAY   = (255, 200, 0)    # gold highlight border for today
+C_TODAY_HDR = (220, 150, 0)  # darker gold for header background of today
 
 _FREG = ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
          "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"]
@@ -59,7 +59,7 @@ def lf(size, bold=False):
             except OSError: pass
     return ImageFont.load_default()
 
-# ── Bavarian holidays ──────────────────────────────────────────────────────────
+# ── Bavarian holidays ─────────────────────────────────────────────────────────
 def _easter(y):
     a=y%19;b=y//100;c=y%100;d=b//4;e=b%4;f=(b+8)//25;g=(b-f+1)//3
     h=(19*a+b-d-g+15)%30;i=c//4;k=c%4;l=(32+2*e+2*i-h-k)%7
@@ -79,11 +79,9 @@ def bavaria_holidays(y):
     }
 
 def week_holiday_map(monday_date):
-    y = monday_date.year
-    hols = bavaria_holidays(y)
-    if (monday_date+timedelta(4)).year != y:
-        hols.update(bavaria_holidays(y+1))
-    short = ['Mo','Di','Mi','Do','Fr']
+    y=monday_date.year; hols=bavaria_holidays(y)
+    if (monday_date+timedelta(4)).year!=y: hols.update(bavaria_holidays(y+1))
+    short=['Mo','Di','Mi','Do','Fr']
     return {f"{short[i]} {(monday_date+timedelta(i)).strftime('%d.%m')}":
             hols.get(monday_date+timedelta(i)) for i in range(5)}
 
@@ -101,9 +99,6 @@ def german_time(dt):
 
 def kw_label(dt):
     d=german_time(dt); y,w,_=d.isocalendar(); return f"{y}-W{w:02d}",int(w)
-
-def week_dates_for_monday(monday):
-    return [monday+timedelta(i) for i in range(5)]
 
 def day_key(dt_obj):
     return f"{'Mo Di Mi Do Fr'.split()[dt_obj.weekday()]} {dt_obj.strftime('%d.%m')}"
@@ -147,107 +142,80 @@ def switch_to_german(page):
     global _LANG_STORAGE
     before = _snap(page)
 
-    # The language items live in a mat-menu that is only in the DOM AFTER
-    # its trigger button is clicked.  Try several trigger selectors first.
     TRIGGER_SELS = [
-        # icon button that opens the language dropdown
-        "button[aria-label='language']",
-        "button[aria-label='Language']",
-        "button[aria-label*='language' i]",
-        "button[aria-label*='sprache' i]",
-        # sometimes shows the current language name
-        "button:has-text('English')",
-        "button:has-text('EN')",
-        # mat-select
-        "mat-select[aria-label*='lang' i]",
-        # generic: any button containing a flag img
-        "button:has(img[src*='flags'])",
+        "button[aria-label='language']", "button[aria-label='Language']",
+        "button[aria-label*='language' i]", "button[aria-label*='sprache' i]",
+        "button:has-text('English')", "button:has-text('EN')",
+        "mat-select[aria-label*='lang' i]", "button:has(img[src*='flags'])",
     ]
-
-    # Direct DE button selectors (in case menu is already open / inline)
     DE_SELS = [
-        "button[value='de-DE']",
-        "button[aria-label='Deutsch']",
-        "button[lang='de-DE']",
-        "[aria-label='Deutsch']",
-        "img[src*='de-DE']",
+        "button[value='de-DE']", "button[aria-label='Deutsch']",
+        "button[lang='de-DE']", "[aria-label='Deutsch']", "img[src*='de-DE']",
     ]
 
     def _click_de():
         for sel in DE_SELS:
             try:
-                el = page.wait_for_selector(sel, timeout=2500, state="visible")
+                el=page.wait_for_selector(sel, timeout=2500, state="visible")
                 if el:
-                    tag = page.evaluate("(el)=>el.tagName", el)
-                    if tag == 'IMG':
+                    tag=page.evaluate("(el)=>el.tagName", el)
+                    if tag=='IMG':
                         page.evaluate("(el)=>{var b=el.closest('button,a')||el;b.click();}", el)
-                    else:
-                        el.click()
-                    print(f"  [lang] ✓ clicked DE via {sel!r}")
-                    return True
+                    else: el.click()
+                    print(f"  [lang] ✓ clicked DE via {sel!r}"); return True
             except: pass
         return False
 
-    # 1. Try direct click first (menu might already be open or inline)
     if _click_de():
         pass
     else:
         print("  [lang] DE button not visible, trying trigger buttons...")
-        opened = False
+        opened=False
         for tsel in TRIGGER_SELS:
             try:
                 page.click(tsel, timeout=2500)
                 print(f"  [lang] opened language menu via {tsel!r}")
-                page.wait_for_timeout(700)
-                opened = True
-                break
+                page.wait_for_timeout(700); opened=True; break
             except: pass
-
         if not opened:
-            # Last resort: look for any element with DE flag img and click parent
             print("  [lang] trigger not found, trying flag img JS click...")
-            result = page.evaluate(r"""
+            result=page.evaluate(r"""
             (function(){
-              var img = document.querySelector("img[src*='de-DE'], img[alt='Deutsch'], img[title='Deutsch']");
-              if (!img) { return 'img not found'; }
-              var btn = img.closest('button,a,[role=menuitem],[role=option]') || img.parentElement;
-              btn.click(); return 'clicked: ' + btn.tagName + ' | ' + (img.src||'');
+              var img=document.querySelector("img[src*='de-DE'],img[alt='Deutsch'],img[title='Deutsch']");
+              if(!img)return 'img not found';
+              var btn=img.closest('button,a,[role=menuitem],[role=option]')||img.parentElement;
+              btn.click();return 'clicked:'+btn.tagName+'|'+(img.src||'');
             })()
             """)
             print(f"  [lang] JS fallback: {result}")
             page.wait_for_timeout(700)
-
         if not _click_de():
             print("  [lang] ✗ WARNING: could not switch to German – will be in English")
             return False
 
     page.wait_for_timeout(1200)
-    after = _snap(page)
-    diff  = {k:v for k,v in after.items() if before.get(k)!=v}
+    after=_snap(page)
+    diff={k:v for k,v in after.items() if before.get(k)!=v}
     if diff:
-        _LANG_STORAGE = diff
-        print(f"  [lang] localStorage diff: { {k:v for k,v in diff.items()} }")
+        _LANG_STORAGE=diff
+        print(f"  [lang] localStorage diff: {dict(diff)}")
     else:
-        _LANG_STORAGE = {k:'de' for k in
+        _LANG_STORAGE={k:'de' for k in
             ['language','locale','lang','i18n','selectedLanguage','appLanguage',
              'selectedLocale','userLanguage','NG_TRANSLATE_LANG_KEY']}
         print("  [lang] no diff – injecting fallback keys")
-
     for de_sel in ["text=Suppe / Vorspeise","text=Suppe","text=Essen 1","h3.category-header"]:
         try:
             page.wait_for_selector(de_sel, timeout=3000)
             print(f"  [lang] German UI confirmed via {de_sel!r}"); return True
         except: pass
-    print("  [lang] German UI not yet confirmed (may appear after navigation)")
+    print("  [lang] German UI not yet confirmed")
     return False
-
 
 def warmup(page, base_url):
     print("[warmup] Loading base URL...")
-    try:
-        page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
-    except Exception as e:
-        print(f"[warmup] goto failed: {e}"); return
+    try: page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
+    except Exception as e: print(f"[warmup] goto failed: {e}"); return
     page.wait_for_timeout(1800)
     dismiss_cookie(page)
     switch_to_german(page)
@@ -257,51 +225,35 @@ def warmup(page, base_url):
 # ── DOM extractor ──────────────────────────────────────────────────────────────
 JS_EXTRACT = r"""
 (function(){
-  var panel = null;
-  var panels = Array.from(document.querySelectorAll(
-    'mat-tab-nav-panel, [role="tabpanel"], mat-tab-body'
-  ));
-  for (var p of panels) {
-    var s = window.getComputedStyle(p);
-    if (s.display !== 'none' && s.visibility !== 'hidden' && p.offsetHeight > 0) {
-      panel = p; break;
-    }
-  }
-  if (!panel && panels.length) panel = panels[0];
-  var root = panel || document;
-
-  var result = [];
-  var categories = Array.from(root.querySelectorAll('app-category, .grid-row'));
-  if (!categories.length)
-    categories = Array.from(root.querySelectorAll('h3.category-header')).map(h=>h.parentElement);
-
-  for (var cat of categories) {
-    var hdr = cat.querySelector('h3.category-header, .category-header, h3');
-    var catName = hdr ? hdr.textContent.trim() : '';
-    if (!catName) continue;
-
-    var products = Array.from(cat.querySelectorAll('div.product-wrapper'));
-    if (!products.length)
-      products = Array.from(cat.querySelectorAll('[class*="product"]'));
-
-    var catProducts = [];
-    for (var prod of products) {
-      var nameEl = prod.querySelector(
-        'span.legacy-text-xxl, span.pre-wrap, button span, .name-column span'
-      );
-      var rawName = nameEl ? nameEl.textContent : '';
-      var name = rawName.trim().replace(/\u00a0/g,' ');
-
-      var priceEls = Array.from(prod.querySelectorAll('div.price, .price'));
-      var intPrice = '', extPrice = '';
-      for (var pe of priceEls) {
-        var pt = pe.textContent.replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim();
-        if (/^Int/i.test(pt))  intPrice  = pt.replace(/^Int\s*/i,'').trim();
-        if (/^Ext/i.test(pt))  extPrice  = pt.replace(/^Ext\s*/i,'').trim();
+  var panel=null;
+  var panels=Array.from(document.querySelectorAll('mat-tab-nav-panel,[role="tabpanel"],mat-tab-body'));
+  for(var p of panels){var s=window.getComputedStyle(p);if(s.display!=='none'&&s.visibility!=='hidden'&&p.offsetHeight>0){panel=p;break;}}
+  if(!panel&&panels.length)panel=panels[0];
+  var root=panel||document;
+  var result=[];
+  var categories=Array.from(root.querySelectorAll('app-category,.grid-row'));
+  if(!categories.length)categories=Array.from(root.querySelectorAll('h3.category-header')).map(h=>h.parentElement);
+  for(var cat of categories){
+    var hdr=cat.querySelector('h3.category-header,.category-header,h3');
+    var catName=hdr?hdr.textContent.trim():'';
+    if(!catName)continue;
+    var products=Array.from(cat.querySelectorAll('div.product-wrapper'));
+    if(!products.length)products=Array.from(cat.querySelectorAll('[class*="product"]'));
+    var catProducts=[];
+    for(var prod of products){
+      var nameEl=prod.querySelector('span.legacy-text-xxl,span.pre-wrap,button span,.name-column span');
+      var rawName=nameEl?nameEl.textContent:'';
+      var name=rawName.trim().replace(/\u00a0/g,' ');
+      var priceEls=Array.from(prod.querySelectorAll('div.price,.price'));
+      var intPrice='',extPrice='';
+      for(var pe of priceEls){
+        var pt=pe.textContent.replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim();
+        if(/^Int/i.test(pt))intPrice=pt.replace(/^Int\s*/i,'').trim();
+        if(/^Ext/i.test(pt))extPrice=pt.replace(/^Ext\s*/i,'').trim();
       }
-      catProducts.push({name:name, intPrice:intPrice, extPrice:extPrice});
+      catProducts.push({name:name,intPrice:intPrice,extPrice:extPrice});
     }
-    result.push({category:catName, products:catProducts});
+    result.push({category:catName,products:catProducts});
   }
   return JSON.stringify(result);
 })()
@@ -316,159 +268,97 @@ CAT_NORM = {
     'fisch':'Essen 3','fish':'Essen 3',
 }
 
-def norm_cat(raw):
-    return CAT_NORM.get(raw.lower().strip(), raw.strip())
+def norm_cat(raw): return CAT_NORM.get(raw.lower().strip(), raw.strip())
 
 def vv_from_name(name):
-    low = name.lower()
+    low=name.lower()
     if any(w in low for w in ['vegan','vegane','veganer','veganes']): return 'VG'
-    if any(w in low for w in ['vegetarian','vegetarisch','vegetarische',
-                               'vegetarischer','vegetarisches']): return 'V'
+    if any(w in low for w in ['vegetarian','vegetarisch','vegetarische','vegetarischer','vegetarisches']): return 'V'
     return ''
 
 def _dedup_products(prods):
-    """
-    Angular renders each product-wrapper twice (enter/leave animation).
-    Deduplicate by keeping only the first occurrence of each (name, intPrice).
-    """
-    seen = set(); out = []
+    seen=set(); out=[]
     for p in prods:
-        key = (p['name'].strip().lower(), p['intPrice'].strip())
-        if key not in seen:
-            seen.add(key); out.append(p)
+        key=(p['name'].strip().lower(), p['intPrice'].strip())
+        if key not in seen: seen.add(key); out.append(p)
     return out
 
 def _names_differ(a, b):
-    """True if a and b are meaningfully different (ignoring quotes/case/spaces)."""
-    def norm(s): return re.sub(r'[\s"\'«»„"]+','', s).lower()
-    return norm(a) != norm(b)
+    def norm(s): return re.sub(r'[\s"\'\u00ab\u00bb\u201e\u201c]+','',s).lower()
+    return norm(a)!=norm(b)
 
 def parse_dom_result(raw_json):
-    try:
-        data = json.loads(raw_json)
-    except Exception as e:
-        print(f"  [parse] JSON decode error: {e}"); return []
-
-    dishes = []
+    try: data=json.loads(raw_json)
+    except Exception as e: print(f"  [parse] JSON error: {e}"); return []
+    dishes=[]
     for cat_entry in data:
-        cat = norm_cat(cat_entry.get('category',''))
-        if not cat:
-            print(f"  [parse] skip unknown category: {cat_entry.get('category')!r}"); continue
-
-        prods = _dedup_products(cat_entry.get('products', []))
+        cat=norm_cat(cat_entry.get('category',''))
+        if not cat: print(f"  [parse] skip: {cat_entry.get('category')!r}"); continue
+        prods=_dedup_products(cat_entry.get('products',[]))
         print(f"  [parse] {cat!r} → {len(cat_entry['products'])} raw → {len(prods)} deduped")
-
-        main_dish = None
-        skip_next_as_oder = False   # True right after an 'oder' separator
-
+        main_dish=None; skip_next_as_oder=False
         for p in prods:
-            name = p['name'].strip().replace('\n', ' / ')
-            is_oder_sep = re.match(r'^(oder|or)$', name.strip(), re.IGNORECASE)
-
-            if is_oder_sep:
-                skip_next_as_oder = True
-                print(f"    [parse] 'oder' separator")
-                continue
-
+            name=p['name'].strip().replace('\n',' / ')
+            if re.match(r'^(oder|or)$',name.strip(),re.IGNORECASE):
+                skip_next_as_oder=True; print(f"    [parse] 'oder' separator"); continue
             if main_dish is None:
-                main_dish = {
-                    'kategorie':  cat,
-                    'name':       name,
-                    'preis_int':  p['intPrice'],
-                    'vv':         vv_from_name(name),
-                    'oder':       '',
-                    'oder_preis': '',
-                }
-                skip_next_as_oder = False
+                main_dish={'kategorie':cat,'name':name,'preis_int':p['intPrice'],
+                           'vv':vv_from_name(name),'oder':'','oder_preis':''}
+                skip_next_as_oder=False
                 print(f"    [parse] main: {name!r} | Int:{p['intPrice']!r}")
-            elif skip_next_as_oder or main_dish['oder'] == '':
-                # Only store as oder if the name is actually different
-                if _names_differ(main_dish['name'], name):
-                    main_dish['oder']       = name
-                    main_dish['oder_preis'] = p['intPrice']
-                    print(f"    [parse] oder: {name!r} | Int:{p['intPrice']!r}")
+            elif skip_next_as_oder or main_dish['oder']=='':
+                if _names_differ(main_dish['name'],name):
+                    main_dish['oder']=name; main_dish['oder_preis']=p['intPrice']
+                    print(f"    [parse] oder: {name!r}")
                 else:
-                    print(f"    [parse] skip duplicate oder (same name): {name!r}")
-                skip_next_as_oder = False
-
-        if main_dish:
-            dishes.append(main_dish)
-
+                    print(f"    [parse] skip dup oder: {name!r}")
+                skip_next_as_oder=False
+        if main_dish: dishes.append(main_dish)
     return dishes
 
 
-# ── Fallback: innerText line-parser ───────────────────────────────────────────
-INT_PRICE_RE = re.compile(
-    r'Int[\s\u00a0]+[\u20ac$]?([0-9]+[.,][0-9]{2})'
-    r'|Int[\s\u00a0]+([0-9]+[.,][0-9]{2})[\s\u00a0]*[\u20ac$]',
-    re.IGNORECASE
-)
-ALLERGEN_RE = re.compile(r'^[A-Z]{1,10}$')
-OR_RE       = re.compile(r'^(oder|or)$', re.IGNORECASE)
-EXT_RE      = re.compile(r'^Ext[\s\u00a0]', re.IGNORECASE)
-
-CAT_HEADERS_FB = {
-    'Soup / Starter':'Suppe','Soup/Starter':'Suppe','Soup':'Suppe',
-    'Suppe / Vorspeise':'Suppe','Suppe/Vorspeise':'Suppe','Suppe':'Suppe',
-    'Food 1':'Essen 1','Food 2':'Essen 2','Food 3':'Essen 3',
-    'Essen 1':'Essen 1','Essen 2':'Essen 2','Essen 3':'Essen 3',
-    'Gericht 1':'Essen 1','Gericht 2':'Essen 2','Gericht 3':'Essen 3',
-    'Fish':'Essen 3','Fisch':'Essen 3',
-}
-NOISE_FB = {
-    'Learn more','Got it!','home','Home','view_compact','Menu','place',
-    'Stores','Impressum','close','Close','English','Lunch','filter_list',
-    'Filter','Store','clear','Info','MyCasinoCard','Opening hours',
-    'Nutzungsbedingungen','Datenschutzerklärung','Speiseplan','Mittagessen',
-    'Informationen','Deutsch','Mehr erfahren','note','Aktuelle Woche',
-}
+# ── Fallback: innerText line-parser ──────────────────────────────────────────
+INT_PRICE_RE=re.compile(r'Int[\s\u00a0]+[\u20ac$]?([0-9]+[.,][0-9]{2})|Int[\s\u00a0]+([0-9]+[.,][0-9]{2})[\s\u00a0]*[\u20ac$]',re.IGNORECASE)
+ALLERGEN_RE=re.compile(r'^[A-Z]{1,10}$')
+OR_RE=re.compile(r'^(oder|or)$',re.IGNORECASE)
+EXT_RE=re.compile(r'^Ext[\s\u00a0]',re.IGNORECASE)
+CAT_HEADERS_FB={'Soup / Starter':'Suppe','Soup/Starter':'Suppe','Soup':'Suppe','Suppe / Vorspeise':'Suppe','Suppe/Vorspeise':'Suppe','Suppe':'Suppe','Food 1':'Essen 1','Food 2':'Essen 2','Food 3':'Essen 3','Essen 1':'Essen 1','Essen 2':'Essen 2','Essen 3':'Essen 3','Gericht 1':'Essen 1','Gericht 2':'Essen 2','Gericht 3':'Essen 3','Fish':'Essen 3','Fisch':'Essen 3'}
+NOISE_FB={'Learn more','Got it!','home','Home','view_compact','Menu','place','Stores','Impressum','close','Close','English','Lunch','filter_list','Filter','Store','clear','Info','MyCasinoCard','Opening hours','Nutzungsbedingungen','Datenschutzerkl\u00e4rung','Speiseplan','Mittagessen','Informationen','Deutsch','Mehr erfahren','note','Aktuelle Woche'}
 
 def _norm_price(raw):
     try: return f"{float(raw.replace(',','.')):.2f}".replace('.',',')
     except: return raw
 
 def parse_flat_fallback(lines):
-    print("  [fallback-parser] running innerText line parser")
+    print("  [fallback-parser] running")
     dishes=[]; cur_cat=None; cur_vv=''; cur_name=[]; seen_cats=set()
     after_oder=False; oder_name=[]
     SLOTS=['Suppe','Essen 1','Essen 2','Essen 3']
-
     def next_free(slot):
         try: idx=SLOTS.index(slot)
         except: return None
         return next((s for s in SLOTS[idx+1:] if s not in seen_cats),None)
-
     def flush(price=''):
         nonlocal cur_name,cur_vv,after_oder,oder_name
-        toks=[t for t in cur_name
-              if not ALLERGEN_RE.match(t) and not OR_RE.match(t)
-              and t not in NOISE_FB and not INT_PRICE_RE.search(t) and not EXT_RE.match(t)]
+        toks=[t for t in cur_name if not ALLERGEN_RE.match(t) and not OR_RE.match(t) and t not in NOISE_FB and not INT_PRICE_RE.search(t) and not EXT_RE.match(t)]
         while toks and ALLERGEN_RE.match(toks[-1]): toks.pop()
         name=' '.join(toks).strip()
         if cur_cat and name and len(name)>=3 and cur_cat not in seen_cats:
-            dishes.append({'kategorie':cur_cat,'name':name,
-                           'preis_int':price+'\u00a0\u20ac' if price else '',
-                           'vv':cur_vv,'oder':'','oder_preis':''})
+            dishes.append({'kategorie':cur_cat,'name':name,'preis_int':price+'\u00a0\u20ac' if price else '','vv':cur_vv,'oder':'','oder_preis':''})
             seen_cats.add(cur_cat)
         cur_name=[]; cur_vv=''; after_oder=False; oder_name=[]
-
     def flush_oder():
         nonlocal after_oder,oder_name
-        toks=[t for t in oder_name
-              if not ALLERGEN_RE.match(t) and t not in NOISE_FB
-              and not INT_PRICE_RE.search(t) and not EXT_RE.match(t)]
+        toks=[t for t in oder_name if not ALLERGEN_RE.match(t) and t not in NOISE_FB and not INT_PRICE_RE.search(t) and not EXT_RE.match(t)]
         while toks and ALLERGEN_RE.match(toks[-1]): toks.pop()
         name=' '.join(toks).strip()
         if name and len(name)>=3:
             for dish in reversed(dishes):
                 if dish['kategorie']==cur_cat:
-                    if _names_differ(dish['name'], name):
-                        dish['oder']=name
+                    if _names_differ(dish['name'],name): dish['oder']=name
                     break
         after_oder=False; oder_name=[]
-
     VEGAN_LABELS={'Vegan':'VG','Vegetarian':'V','Vegetarisch':'V','vegetarisch':'V'}
-
     for line in lines:
         line=line.strip()
         if not line or line in NOISE_FB: continue
@@ -498,109 +388,76 @@ def parse_flat_fallback(lines):
 
 
 # ── JS helpers ─────────────────────────────────────────────────────────────────
-JS_CLICK_TAB = r"""
+JS_CLICK_TAB=r"""
 (function(dateStr){
-  var tabs=Array.from(document.querySelectorAll('[role="tab"], .mdc-tab, .mat-tab-label, .mat-mdc-tab'));
-  var all=Array.from(document.querySelectorAll('button,a,div,span,li')).filter(el=>{
-    var t=(el.innerText||el.textContent||'').trim();
-    return t.includes(dateStr) && t.length<40;
-  });
+  var tabs=Array.from(document.querySelectorAll('[role="tab"],.mdc-tab,.mat-tab-label,.mat-mdc-tab'));
+  var all=Array.from(document.querySelectorAll('button,a,div,span,li')).filter(el=>{var t=(el.innerText||el.textContent||'').trim();return t.includes(dateStr)&&t.length<40;});
   var target=tabs.concat(all).find(el=>(el.innerText||el.textContent||'').trim().includes(dateStr));
-  if(target){target.click();return(target.innerText||target.textContent||'').trim().slice(0,60);}
-  return null;
+  if(target){target.click();return(target.innerText||target.textContent||'').trim().slice(0,60);}return null;
 })
 """
-
-JS_TAB_TEXT = r"""
-(function(){
-  var panels=Array.from(document.querySelectorAll('mat-tab-nav-panel,[role="tabpanel"],mat-tab-body'));
-  var active=panels.find(p=>{var s=window.getComputedStyle(p);return s.display!=='none'&&s.visibility!=='hidden'&&p.offsetHeight>0;})||panels[0];
-  if(!active){var b=document.body.cloneNode(true);b.querySelectorAll('script,style,noscript').forEach(e=>e.remove());return b.innerText||b.textContent||'';}
-  return active.innerText||active.textContent||'';
-})()
+JS_TAB_TEXT=r"""
+(function(){var panels=Array.from(document.querySelectorAll('mat-tab-nav-panel,[role="tabpanel"],mat-tab-body'));var active=panels.find(p=>{var s=window.getComputedStyle(p);return s.display!=='none'&&s.visibility!=='hidden'&&p.offsetHeight>0;})||panels[0];if(!active){var b=document.body.cloneNode(true);b.querySelectorAll('script,style,noscript').forEach(e=>e.remove());return b.innerText||b.textContent||'';}return active.innerText||active.textContent||'';})()
 """
 
-# ── Scrape one day ─────────────────────────────────────────────────────────────
+# ── Scrape one day ────────────────────────────────────────────────────────────
 def scrape_day(page, date_obj):
     url=f"{URL_BASE}/date/{date_obj.strftime('%Y-%m-%d')}"
     if _SID: url+=f"?ste_sid={_SID}"
     date_label=date_obj.strftime('%d.%m')
     print(f"\n[scrape] {url}  [{date_label}]")
-
     page.goto(url, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(800)
     _inject(page)
     page.wait_for_timeout(400)
     dismiss_cookie(page)
-
     found_sel=None
-    for sel in ["h3.category-header","text=Suppe / Vorspeise","text=Suppe",
-                "text=Essen 1","text=Soup / Starter","text=Food 1",
-                ".category-grid","app-category-list"]:
+    for sel in ["h3.category-header","text=Suppe / Vorspeise","text=Suppe","text=Essen 1","text=Soup / Starter","text=Food 1",".category-grid","app-category-list"]:
         try:
-            page.wait_for_selector(sel, timeout=12000)
-            found_sel=sel; print(f"  [wait] found: {sel!r}"); break
+            page.wait_for_selector(sel,timeout=12000); found_sel=sel; print(f"  [wait] found: {sel!r}"); break
         except: pass
     if not found_sel:
-        print("  [wait] WARNING: no menu selector after 12s, extra 5s wait")
-        page.wait_for_timeout(5000)
-
+        print("  [wait] WARNING: no menu selector, extra 5s"); page.wait_for_timeout(5000)
     try:
         hdrs=page.evaluate("()=>Array.from(document.querySelectorAll('h3.category-header,h3')).map(h=>h.textContent.trim()).filter(Boolean)")
         print(f"  [debug] h3 headers: {hdrs}")
     except: pass
-
     before_sig=' '.join((page.evaluate(JS_TAB_TEXT) or '').split()[:8])
     clicked=page.evaluate(f"({JS_CLICK_TAB})('{date_label}')")
     print(f"  [tab] click result: {clicked!r}")
-
     if clicked:
         for attempt in range(25):
             page.wait_for_timeout(200)
-            sig=' '.join((page.evaluate(JS_TAB_TEXT) or '').split()[:8])
-            if sig!=before_sig:
+            if ' '.join((page.evaluate(JS_TAB_TEXT) or '').split()[:8])!=before_sig:
                 print(f"  [tab] content changed after {attempt+1} polls"); break
-        else:
-            print("  [tab] content unchanged (already on correct tab)")
+        else: print("  [tab] content unchanged")
     else:
-        print(f"  [tab] no tab for {date_label!r}, using current content")
-        page.wait_for_timeout(800)
-
+        print(f"  [tab] no tab for {date_label!r}"); page.wait_for_timeout(800)
     try:
         hdrs2=page.evaluate("()=>Array.from(document.querySelectorAll('h3.category-header')).map(h=>h.textContent.trim())")
         print(f"  [debug] category-header after tab: {hdrs2}")
     except: pass
-
-    # PRIMARY: DOM extractor
     dishes=[]
     try:
         raw_json=page.evaluate(JS_EXTRACT)
         print(f"  [dom] JS_EXTRACT length: {len(raw_json) if raw_json else 0}")
         if raw_json and raw_json!='[]':
-            dishes=parse_dom_result(raw_json)
-            print(f"  [dom] {len(dishes)} dishes via DOM extractor")
-        else:
-            print("  [dom] empty result, falling back")
-    except Exception as e:
-        print(f"  [dom] error: {e}")
-
-    # FALLBACK: innerText line parser
+            dishes=parse_dom_result(raw_json); print(f"  [dom] {len(dishes)} dishes")
+        else: print("  [dom] empty, falling back")
+    except Exception as e: print(f"  [dom] error: {e}")
     if not dishes:
-        print("  [fallback] switching to innerText parser")
         raw=page.evaluate(JS_TAB_TEXT) or ''
         lines=[l.strip() for l in raw.splitlines() if l.strip()]
         print(f"  [fallback] {len(lines)} lines")
-        for i,l in enumerate(lines[:40]):
-            print(f"    {i:3d}: {l[:100]}")
+        for i,l in enumerate(lines[:40]): print(f"    {i:3d}: {l[:100]}")
         dishes=parse_flat_fallback(lines)
-
     for dish in dishes:
         print(f"  [result] {dish['kategorie']:8s} | vv={dish['vv']!r:3s} | {dish['name'][:35]!r}"
               +(f" | oder: {dish['oder'][:25]!r}" if dish.get('oder') else ''))
     return dishes
 
 
-# ── Render ─────────────────────────────────────────────────────────────────────
+# ── Render helpers ─────────────────────────────────────────────────────────────
 def wrap_text(draw,text,f,max_w,max_lines=4):
     out,cur=[],[]
     for w in text.split():
@@ -614,40 +471,76 @@ def wrap_text(draw,text,f,max_w,max_lines=4):
     if cur: out.append(' '.join(cur))
     return out[:max_lines]
 
+def _is_past(day_key_str, today_date):
+    try:
+        dm=day_key_str.split(' ')[1].split('.')
+        return date(today_date.year,int(dm[1]),int(dm[0]))<today_date
+    except: return False
+
+def _is_today(day_key_str, today_date):
+    try:
+        dm=day_key_str.split(' ')[1].split('.')
+        return date(today_date.year,int(dm[1]),int(dm[0]))==today_date
+    except: return False
+
 CATS=['Suppe','Essen 1','Essen 2','Essen 3']
 CAT_LABEL={'Suppe':'Suppe','Essen 1':'Essen 1','Essen 2':'Essen 2','Essen 3':'Essen 3'}
 
-def render(week_data,kw,label,local_dt,url_menu,holiday_map,today_date,source=''):
+
+def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
+           monday_date, source=''):
     img=Image.new('RGB',(W,H),(255,255,255))
     d=ImageDraw.Draw(img)
-    # Larger fonts for readability on the photo frame
-    ftit  = lf(22, True)   # header title
-    fday  = lf(17, True)   # day column header
-    ftxt  = lf(17)         # dish name
-    fsmall= lf(14)         # oder-alternative
-    fbdg  = lf(13, True)   # vegan/veg badge
-    fprc  = lf(14)         # price
-    fftr  = lf(10)         # footer
-    fstb  = lf(13, True)   # row stub label
+    ftit  = lf(20, True)
+    fdate = lf(14)          # date range in header
+    fday  = lf(17, True)
+    ftxt  = lf(17)
+    fsmall= lf(14)
+    fbdg  = lf(13, True)
+    fprc  = lf(14)
+    fftr  = lf(10)
+    fstb  = lf(13, True)
 
-    HDR_H=52; DAY_H=30; LEGEND_H=24; STUB_W=60
+    HDR_H=56; DAY_H=30; LEGEND_H=24; STUB_W=60
+    TODAY_BW=3   # border width for today highlight
 
+    # ── Header: title + date range ──
     d.rectangle([(0,0),(W,HDR_H)],fill=BLUE)
-    title=f'Siemens Kantine Regensburg  \u2502  KW {kw:02d}'
-    b=d.textbbox((0,0),title,font=ftit)
-    d.text(((W-(b[2]-b[0]))//2,(HDR_H-(b[3]-b[1]))//2),title,font=ftit,fill=WHITE)
+    friday_date = monday_date + timedelta(4)
+    date_range  = f"{monday_date.strftime('%d.%m.%Y')} – {friday_date.strftime('%d.%m.%Y')}"
+    title_str   = f"Siemens Kantine Regensburg  |  KW {kw:02d}"
+    bt=d.textbbox((0,0),title_str,font=ftit)
+    title_h=bt[3]-bt[1]
+    bd=d.textbbox((0,0),date_range,font=fdate)
+    date_h=bd[3]-bd[1]
+    total_h=title_h+4+date_h
+    ty=(HDR_H-total_h)//2
+    d.text(((W-(bt[2]-bt[0]))//2, ty), title_str, font=ftit, fill=WHITE)
+    d.text(((W-(bd[2]-bd[0]))//2, ty+title_h+4), date_range, font=fdate, fill=(180,210,240))
     y=HDR_H
 
     all_days=list(holiday_map.keys()); dw=(W-STUB_W)//len(all_days)
     d.rectangle([(0,y),(STUB_W-1,y+DAY_H-1)],fill=BLUE)
     for i,day in enumerate(all_days):
         x=STUB_W+i*dw
-        is_hol=holiday_map[day] is not None; is_past=_is_past(day,today_date)
-        col=C_HOL_HDR if is_hol else (C_PAST_TXT if is_past else LIGHT)
+        is_hol  = holiday_map[day] is not None
+        is_past = _is_past(day, today_date)
+        is_today= _is_today(day, today_date)
+        if is_today:
+            col = C_TODAY_HDR
+        elif is_hol:
+            col = C_HOL_HDR
+        elif is_past:
+            col = C_PAST_TXT
+        else:
+            col = LIGHT
         d.rectangle([(x,y),(x+dw-1,y+DAY_H-1)],fill=col)
         b=d.textbbox((0,0),day,font=fday)
         d.text((x+(dw-(b[2]-b[0]))//2,y+(DAY_H-(b[3]-b[1]))//2),day,font=fday,fill=WHITE)
         d.line([(x,y),(x,y+DAY_H)],fill=BLUE,width=1)
+        # Today: draw a gold top border line
+        if is_today:
+            d.line([(x,y),(x+dw,y)],fill=C_TODAY,width=TODAY_BW)
     y+=DAY_H
 
     avail=H-y-FOOTER_H-LEGEND_H-4
@@ -657,6 +550,7 @@ def render(week_data,kw,label,local_dt,url_menu,holiday_map,today_date,source=''
     for ri,cat in enumerate(CATS):
         rh=ROW_H[cat]
         d.line([(0,y),(W,y)],fill=GRID,width=1)
+        # row stub
         d.rectangle([(0,y),(STUB_W-1,y+rh-1)],fill=BLUE)
         lbl=CAT_LABEL[cat]
         b=d.textbbox((0,0),lbl,font=fstb)
@@ -667,10 +561,26 @@ def render(week_data,kw,label,local_dt,url_menu,holiday_map,today_date,source=''
 
         for i,day in enumerate(all_days):
             x=STUB_W+i*dw
-            is_hol=holiday_map[day] is not None; is_past=_is_past(day,today_date)
-            bg=C_PAST_BG if is_past else (C_HOL_BG if is_hol else (R_ODD if ri%2==0 else R_EVEN))
+            is_hol  = holiday_map[day] is not None
+            is_past = _is_past(day, today_date)
+            is_today= _is_today(day, today_date)
+
+            if is_past:
+                bg = C_PAST_BG
+            elif is_hol:
+                bg = C_HOL_BG
+            elif is_today:
+                bg = (255, 253, 230)   # very light gold tint
+            else:
+                bg = R_ODD if ri%2==0 else R_EVEN
+
             d.rectangle([(x,y),(x+dw-1,y+rh-1)],fill=bg)
             d.line([(x,y),(x,y+rh)],fill=GRID,width=1)
+
+            # Today: left+right gold border lines through entire column
+            if is_today:
+                d.line([(x,y),(x,y+rh)],fill=C_TODAY,width=TODAY_BW)
+                d.line([(x+dw-1,y),(x+dw-1,y+rh)],fill=C_TODAY,width=TODAY_BW)
 
             if is_past:
                 if ri==0:
@@ -713,21 +623,30 @@ def render(week_data,kw,label,local_dt,url_menu,holiday_map,today_date,source=''
             max_ln=max(1,min(4,avail_name//19))
             for ln in wrap_text(d,it['name'],ftxt,avw,max_ln):
                 d.text((cx,cy),ln,font=ftxt,fill=C_TXT);cy+=19
-
             if oder:
                 for ln in wrap_text(d,f"oder: {oder}",fsmall,avw,2):
                     d.text((cx,cy),ln,font=fsmall,fill=(80,120,180));cy+=17
-
             if it['preis_int']:
                 pl=f"Int: {it['preis_int']}"
                 b=d.textbbox((0,0),pl,font=fprc)
                 d.text((x+dw-(b[2]-b[0])-PAD,y+rh-(b[3]-b[1])-4),pl,font=fprc,fill=LIGHT)
+
+            # Today: bottom gold border line per cell
+            if is_today:
+                d.line([(x,y+rh-1),(x+dw,y+rh-1)],fill=C_TODAY,width=TODAY_BW)
         y+=rh
+
+    # After last row: close today border at bottom
+    for i,day in enumerate(all_days):
+        if _is_today(day,today_date):
+            x=STUB_W+i*dw
+            d.line([(x,y),(x+dw,y)],fill=C_TODAY,width=TODAY_BW)
 
     d.line([(0,y),(W,y)],fill=GRID,width=1);y+=1
     d.rectangle([(0,y),(W,y+LEGEND_H)],fill=(245,249,253))
     lx=8
-    for col,txt in [(C_VG,'Vegan'),(C_V,'Vegetarisch'),(C_HOL_HDR,'Feiertag'),(C_PAST_BG,'vergangen')]:
+    for col,txt in [(C_VG,'Vegan'),(C_V,'Vegetarisch'),(C_HOL_HDR,'Feiertag'),
+                    (C_PAST_BG,'vergangen'),(C_TODAY,'Heute')]:
         d.rectangle([(lx,y+6),(lx+14,y+16)],fill=col)
         b=d.textbbox((0,0),txt,font=fprc)
         d.text((lx+18,y+5),txt,font=fprc,fill=C_TXT);lx+=18+(b[2]-b[0])+18
@@ -735,11 +654,6 @@ def render(week_data,kw,label,local_dt,url_menu,holiday_map,today_date,source=''
     _footer(d,kw,label,local_dt,fftr,source)
     return img
 
-def _is_past(day_key_str,today_date):
-    try:
-        dm=day_key_str.split(' ')[1].split('.')
-        return date(today_date.year,int(dm[1]),int(dm[0]))<today_date
-    except: return False
 
 def _footer(d,kw,label,local_dt,f,source=''):
     src=f' – {source}' if source else ''
@@ -751,38 +665,26 @@ def _footer(d,kw,label,local_dt,f,source=''):
     d.text(((W-(b[2]-b[0]))//2,H-18),txt,font=f,fill=WHITE)
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     now=datetime.now(timezone.utc); local=german_time(now)
     today_date=local.date()
-
-    # Determine which Monday to use
-    local_monday = local - timedelta(days=local.weekday())
-    target_monday = (local_monday + timedelta(weeks=WEEK_OFFSET)).date()
-    label, kw = kw_label(datetime.combine(target_monday, datetime.min.time(),
-                                           tzinfo=timezone.utc))
-
+    local_monday=local-timedelta(days=local.weekday())
+    target_monday=(local_monday+timedelta(weeks=WEEK_OFFSET)).date()
+    label,kw=kw_label(datetime.combine(target_monday,datetime.min.time(),tzinfo=timezone.utc))
     out_path=OUT_DIR/f'kantine_{label}.jpg'
     print(f'Week label : {label}  (KW {kw:02d})')
     print(f'Today      : {today_date}')
     print(f'WEEK_OFFSET: {WEEK_OFFSET}  →  scraping week of {target_monday}')
-
     holiday_map=week_holiday_map(target_monday)
     hol_days=[k for k,v in holiday_map.items() if v]
-
-    all_week_dates = [datetime.combine(target_monday+timedelta(i), datetime.min.time(),
-                                        tzinfo=timezone.utc) for i in range(5)]
-    if WEEK_OFFSET == 0:
-        # current week: only today and future, skip holidays
-        scrape_dates=[d for d in all_week_dates
-                      if d.date()>=today_date and day_key(d) not in hol_days]
+    all_week_dates=[datetime.combine(target_monday+timedelta(i),datetime.min.time(),tzinfo=timezone.utc) for i in range(5)]
+    if WEEK_OFFSET==0:
+        scrape_dates=[d for d in all_week_dates if d.date()>=today_date and day_key(d) not in hol_days]
     else:
-        # future week: scrape all non-holiday days
         scrape_dates=[d for d in all_week_dates if day_key(d) not in hol_days]
-
     print(f'Feiertage  : {[(k,holiday_map[k]) for k in hol_days] or "keine"}')
     print(f'Scraping   : {[day_key(d) for d in scrape_dates]}')
-
     week_data={}
     with sync_playwright() as pw:
         browser=pw.chromium.launch()
@@ -790,21 +692,18 @@ def main():
             viewport={"width":1400,"height":900},
             extra_http_headers={"Accept-Language":"de-DE,de;q=0.9,en;q=0.1"},
         )
-        warmup(page, URL_BASE)
+        warmup(page,URL_BASE)
         for date_obj in scrape_dates:
             dk=day_key(date_obj)
             dishes=scrape_day(page,date_obj)
             if dishes: week_data[dk]=dishes
         browser.close()
-
     days_filled=len(week_data); days_avail=len(scrape_dates)
     print(f'\nErgebnis   : {list(week_data.keys())}  ({days_filled}/{days_avail})')
-
     img=render(week_data,kw,label,local,URL_BASE,holiday_map,today_date,
-               f'DOM ({days_filled}/{days_avail} Tage)')
+               target_monday, f'DOM ({days_filled}/{days_avail} Tage)')
     img.save(str(out_path),'JPEG',quality=92)
     print(f'Saved: {out_path}  ({img.size[0]}x{img.size[1]})')
-
     for old in sorted(OUT_DIR.glob('kantine_*.jpg'))[:-MAX_KEEP]:
         old.unlink(); print(f'Removed: {old}')
 
