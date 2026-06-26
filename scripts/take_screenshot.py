@@ -25,6 +25,8 @@ Scraping strategy (DOM-based, not innerText):
  10. Stub labels drawn last so grid lines don't overwrite them.
  11. STUB_W=48 so rotated labels are fully visible.
  12. line_height uses +4px padding for better readability.
+ 13. Grid lines start at STUB_W (not x=0) so they don't cut through stubs.
+ 14. No "Int:" prefix on prices – employee price is self-evident.
 """
 import os, re, json
 from pathlib import Path
@@ -380,7 +382,6 @@ def parse_dom_result(raw_json):
         prods=_dedup_products(cat_entry.get('products',[]))
         print(f"  [parse] {cat!r} (raw:{raw_cat!r}) → {len(cat_entry['products'])} raw → {len(prods)} deduped")
         main_dish=None
-        # Track whether an explicit "oder" separator was seen before the alternative
         explicit_oder=False
         next_is_zusatz=False
 
@@ -393,7 +394,7 @@ def parse_dom_result(raw_json):
                 if remainder and main_dish is not None:
                     main_dish['zusatz'] = f"wahlweise: {remainder}"
                     main_dish['zusatz_preis'] = p['intPrice']
-                    print(f"    [parse] zusatz (inline): {remainder!r} | Int:{p['intPrice']!r}")
+                    print(f"    [parse] zusatz (inline): {remainder!r} | {p['intPrice']!r}")
                 elif main_dish is not None:
                     next_is_zusatz = True
                     print(f"    [parse] zusatz marker found, next product = ingredient")
@@ -403,7 +404,7 @@ def parse_dom_result(raw_json):
                 if main_dish is not None:
                     main_dish['zusatz'] = f"wahlweise: {name}"
                     main_dish['zusatz_preis'] = p['intPrice']
-                    print(f"    [parse] zusatz (next): {name!r} | Int:{p['intPrice']!r}")
+                    print(f"    [parse] zusatz (next): {name!r} | {p['intPrice']!r}")
                 next_is_zusatz = False
                 continue
 
@@ -420,7 +421,7 @@ def parse_dom_result(raw_json):
                            'vv':vv,'oder':'','oder_prefix':'mit','oder_preis':'','oder_vv':'',
                            'zusatz':'','zusatz_preis':''}
                 explicit_oder=False
-                print(f"    [parse] main: {name!r} | Int:{p['intPrice']!r}")
+                print(f"    [parse] main: {name!r} | {p['intPrice']!r}")
             elif explicit_oder or main_dish['oder']=='':
                 if _names_differ(main_dish['name'],name):
                     main_dish['oder']=name
@@ -478,7 +479,7 @@ def parse_flat_fallback(lines):
                 if dish['kategorie']==cur_cat:
                     if _names_differ(dish['name'],name):
                         dish['oder']=name
-                        dish['oder_prefix']='oder'   # fallback always saw explicit "oder"
+                        dish['oder_prefix']='oder'
                         dish['oder_vv']=vv_from_name(name)
                     break
         after_oder=False; oder_name=[]
@@ -714,13 +715,13 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
     fbdg  = lf(13, True)
     fprc  = lf(14, True)
     fftr  = lf(11)
-    fstb  = lf(11, True)
+    fstb  = lf(13, True)   # größer für bessere Lesbarkeit der Stub-Labels
     fleg  = lf(12)
 
     HDR_H   = 52
     DAY_H   = 34
     LEGEND_H= 22
-    STUB_W  = 48          # wider so rotated labels (Su./E1/E2/E3) are fully visible
+    STUB_W  = 48
     TODAY_BW= 3
     PAD     = 5
 
@@ -767,7 +768,8 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
     # ── rows ──────────────────────────────────────────────────────────────────
     for ri,cat in enumerate(CATS):
         rh=ROW_H[cat]
-        d.line([(0,y),(W,y)],fill=GRID,width=1)
+        # Grid-Trennlinie nur ab STUB_W – nie durch den Stub-Bereich
+        d.line([(STUB_W,y),(W,y)],fill=GRID,width=1)
 
         avw = dw - 2*PAD
 
@@ -788,7 +790,7 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
                 badge_h = b[3]-b[1]+4+3
             pr_h = 0
             if it['preis_int']:
-                pb = d.textbbox((0,0),f"Int: {it['preis_int']}",font=fprc)
+                pb = d.textbbox((0,0), it['preis_int'], font=fprc)
                 pr_h = pb[3]-pb[1]+4
             extra = (1 if it.get('oder') else 0) + (1 if it.get('zusatz') else 0)
             reserved = lh_sm * extra + pr_h + PAD
@@ -891,26 +893,25 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
                 for ln in oder_lines:
                     d.text((ocx,cy),ln,font=fo,fill=(80,120,180));cy+=lho
 
-            # wahlweise-Zusatz line
+            # wahlweise-Zusatz line (ohne Int-Prefix)
             if zusatz:
                 ztext = zusatz
                 if zusatz_pr:
-                    ztext += f"  Int: {zusatz_pr}"
+                    ztext += f"  {zusatz_pr}"
                 fz,lhz,z_lines=_fit_font(d,ztext,avw,lh_sm*3,
                                           size_start=min(uniform_size,13),size_min=10)
                 for ln in z_lines:
                     d.text((x+PAD,cy),ln,font=fz,fill=C_ZUSATZ);cy+=lhz
 
-            # Price bottom-right
+            # Preis unten rechts – ohne "Int:" Prefix
             if it['preis_int']:
-                pl=f"Int: {it['preis_int']}"
-                b=d.textbbox((0,0),pl,font=fprc)
-                d.text((x+dw-(b[2]-b[0])-PAD, y+rh-(b[3]-b[1])-3), pl, font=fprc, fill=LIGHT)
+                b=d.textbbox((0,0),it['preis_int'],font=fprc)
+                d.text((x+dw-(b[2]-b[0])-PAD, y+rh-(b[3]-b[1])-3), it['preis_int'], font=fprc, fill=LIGHT)
 
             if is_today:
                 d.line([(x,y+rh-1),(x+dw,y+rh-1)],fill=C_TODAY,width=TODAY_BW)
 
-        # ── Stub label drawn LAST (never overwritten by cell rectangles) ──
+        # ── Stub label drawn LAST (nie von Zellen überschrieben) ──────────
         d.rectangle([(0,y),(STUB_W-1,y+rh-1)],fill=BLUE)
         d.line([(STUB_W,y),(STUB_W,y+rh)],fill=GRID,width=1)
         lbl=CAT_LABEL[cat]
@@ -940,7 +941,6 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
         d.rectangle([(lx,y+5),(lx+12,y+15)],fill=col)
         b=d.textbbox((0,0),txt,font=fleg)
         d.text((lx+15,y+4),txt,font=fleg,fill=C_TXT);lx+=15+(b[2]-b[0])+12
-    d.text((lx,y+4),'Int = Mitarbeiterpreis',font=fleg,fill=(120,120,120))
 
     _footer(d,kw,label,local_dt,fftr,source)
     return img
