@@ -16,6 +16,11 @@ Scraping strategy (DOM-based, not innerText):
   4. Fallback chain: DOM-query → innerText line-parser (legacy).
   5. WEEK_OFFSET env var (default 1): 0=current week, 1=next week.
      When offset > 0 all days of that week are scraped (no "past" filter).
+  6. Unknown categories (Vegan, Vegetarisch, Fisch, …) map to next free
+     Essen slot (2 or 3) for the current day.
+  7. "wahlweise dazu"-products stored as 'zusatz' on the main dish.
+  8. wrap_text: respects existing hyphens before splitting characters.
+  9. render: adaptive font size per cell so all text always fits.
 """
 import os, re, json
 from pathlib import Path
@@ -46,6 +51,7 @@ C_HOL_BG  = (220, 220, 220); C_HOL_HDR = (140, 140, 140); C_HOL_TXT = (100, 100,
 C_PAST_BG = (235, 235, 235); C_PAST_TXT = (160, 160, 160)
 C_TODAY   = (255, 200, 0)
 C_TODAY_HDR = (220, 150, 0)
+C_ZUSATZ  = (120, 80, 180)   # Farbe für "wahlweise dazu"-Zeile
 
 _FREG = ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
          "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"]
@@ -295,21 +301,59 @@ JS_EXTRACT = r"""
 })()
 """
 
-CAT_NORM = {
+# Known fixed mappings
+CAT_NORM_FIXED = {
     'suppe / vorspeise':'Suppe','suppe/vorspeise':'Suppe','suppe':'Suppe',
     'soup / starter':'Suppe','soup/starter':'Suppe','soup':'Suppe',
     'essen 1':'Essen 1','food 1':'Essen 1','gericht 1':'Essen 1',
     'essen 2':'Essen 2','food 2':'Essen 2','gericht 2':'Essen 2',
     'essen 3':'Essen 3','food 3':'Essen 3','gericht 3':'Essen 3',
-    'fisch':'Essen 3','fish':'Essen 3',
 }
+# Categories that are "Essen 2 or 3" variants (vegan, vegetarisch, fisch, …)
+# They get mapped to the next free slot dynamically.
+CAT_FLEXIBLE = {
+    'fisch':'Essen 3','fish':'Essen 3',  # prefer slot 3
+    'vegan':'Essen 2','vegane':'Essen 2',
+    'vegetarisch':'Essen 2','vegetarian':'Essen 2',
+}
+_ESSEN_SLOTS = ['Essen 1','Essen 2','Essen 3']
 
-def norm_cat(raw): return CAT_NORM.get(raw.lower().strip(), raw.strip())
+def norm_cat(raw, used_cats=None):
+    key = raw.lower().strip()
+    if key in CAT_NORM_FIXED:
+        return CAT_NORM_FIXED[key]
+    # Flexible categories: find next free Essen slot
+    if key in CAT_FLEXIBLE:
+        preferred = CAT_FLEXIBLE[key]
+        if used_cats is None:
+            return preferred
+        # Find first free slot starting from preferred
+        try:
+            start_idx = _ESSEN_SLOTS.index(preferred)
+        except ValueError:
+            start_idx = 1
+        for slot in _ESSEN_SLOTS[start_idx:]:
+            if slot not in used_cats:
+                return slot
+        # All slots taken – still use preferred (will overwrite, acceptable)
+        return preferred
+    # Unknown category: treat as next free Essen slot
+    if used_cats is not None:
+        for slot in _ESSEN_SLOTS:
+            if slot not in used_cats:
+                return slot
+    return raw.strip()
 
 def vv_from_name(name):
     low=name.lower()
     if any(w in low for w in ['vegan','vegane','veganer','veganes']): return 'VG'
     if any(w in low for w in ['vegetarian','vegetarisch','vegetarische','vegetarischer','vegetarisches']): return 'V'
+    return ''
+
+def vv_from_cat(raw_cat):
+    key = raw_cat.lower().strip()
+    if key in ('vegan','vegane'): return 'VG'
+    if key in ('vegetarisch','vegetarian'): return 'V'
     return ''
 
 def _dedup_products(prods):
@@ -323,23 +367,41 @@ def _names_differ(a, b):
     def norm(s): return re.sub(r'[\s"\'«»„"]+','',s).lower()
     return norm(a)!=norm(b)
 
+WAHLWEISE_RE = re.compile(r'^wahlweise\s+(dazu\s+)?', re.IGNORECASE)
+
 def parse_dom_result(raw_json):
     try: data=json.loads(raw_json)
     except Exception as e: print(f"  [parse] JSON error: {e}"); return []
     dishes=[]
+    used_cats = set()
     for cat_entry in data:
-        cat=norm_cat(cat_entry.get('category',''))
-        if not cat: print(f"  [parse] skip: {cat_entry.get('category')!r}"); continue
+        raw_cat = cat_entry.get('category','')
+        cat = norm_cat(raw_cat, used_cats)
+        if not cat:
+            print(f"  [parse] skip: {raw_cat!r}")
+            continue
+        # Derive vv from category name if not already in dish name
+        cat_vv = vv_from_cat(raw_cat)
         prods=_dedup_products(cat_entry.get('products',[]))
-        print(f"  [parse] {cat!r} → {len(cat_entry['products'])} raw → {len(prods)} deduped")
+        print(f"  [parse] {cat!r} (raw:{raw_cat!r}) → {len(cat_entry['products'])} raw → {len(prods)} deduped")
         main_dish=None; skip_next_as_oder=False
         for p in prods:
             name=p['name'].strip().replace('\n',' / ')
+            # "wahlweise dazu" → Zusatz am Hauptgericht
+            if WAHLWEISE_RE.match(name):
+                if main_dish is not None:
+                    zusatz_name = WAHLWEISE_RE.sub('', name).strip()
+                    main_dish['zusatz'] = f"wahlweise: {zusatz_name}"
+                    main_dish['zusatz_preis'] = p['intPrice']
+                    print(f"    [parse] zusatz: {zusatz_name!r} | Int:{p['intPrice']!r}")
+                continue
             if re.match(r'^(oder|or)$',name.strip(),re.IGNORECASE):
                 skip_next_as_oder=True; print(f"    [parse] 'oder' separator"); continue
             if main_dish is None:
+                vv = vv_from_name(name) or cat_vv
                 main_dish={'kategorie':cat,'name':name,'preis_int':p['intPrice'],
-                           'vv':vv_from_name(name),'oder':'','oder_preis':'','oder_vv':''}
+                           'vv':vv,'oder':'','oder_preis':'','oder_vv':'',
+                           'zusatz':'','zusatz_preis':''}
                 skip_next_as_oder=False
                 print(f"    [parse] main: {name!r} | Int:{p['intPrice']!r}")
             elif skip_next_as_oder or main_dish['oder']=='':
@@ -351,7 +413,9 @@ def parse_dom_result(raw_json):
                 else:
                     print(f"    [parse] skip dup oder: {name!r}")
                 skip_next_as_oder=False
-        if main_dish: dishes.append(main_dish)
+        if main_dish:
+            dishes.append(main_dish)
+            used_cats.add(cat)
     return dishes
 
 
@@ -360,7 +424,7 @@ INT_PRICE_RE=re.compile(r'Int[\s\u00a0]+[\u20ac$]?([0-9]+[.,][0-9]{2})|Int[\s\u0
 ALLERGEN_RE=re.compile(r'^[A-Z]{1,10}$')
 OR_RE=re.compile(r'^(oder|or)$',re.IGNORECASE)
 EXT_RE=re.compile(r'^Ext[\s\u00a0]',re.IGNORECASE)
-CAT_HEADERS_FB={'Soup / Starter':'Suppe','Soup/Starter':'Suppe','Soup':'Suppe','Suppe / Vorspeise':'Suppe','Suppe/Vorspeise':'Suppe','Suppe':'Suppe','Food 1':'Essen 1','Food 2':'Essen 2','Food 3':'Essen 3','Essen 1':'Essen 1','Essen 2':'Essen 2','Essen 3':'Essen 3','Gericht 1':'Essen 1','Gericht 2':'Essen 2','Gericht 3':'Essen 3','Fish':'Essen 3','Fisch':'Essen 3'}
+CAT_HEADERS_FB={'Soup / Starter':'Suppe','Soup/Starter':'Suppe','Soup':'Suppe','Suppe / Vorspeise':'Suppe','Suppe/Vorspeise':'Suppe','Suppe':'Suppe','Food 1':'Essen 1','Food 2':'Essen 2','Food 3':'Essen 3','Essen 1':'Essen 1','Essen 2':'Essen 2','Essen 3':'Essen 3','Gericht 1':'Essen 1','Gericht 2':'Essen 2','Gericht 3':'Essen 3','Fish':'Essen 3','Fisch':'Essen 3','Vegan':'Essen 2','Vegetarisch':'Essen 2'}
 NOISE_FB={'Learn more','Got it!','home','Home','view_compact','Menu','place','Stores','Impressum','close','Close','English','Lunch','filter_list','Filter','Store','clear','Info','MyCasinoCard','Opening hours','Nutzungsbedingungen','Datenschutzerklärung','Speiseplan','Mittagessen','Informationen','Deutsch','Mehr erfahren','note','Aktuelle Woche'}
 
 def _norm_price(raw):
@@ -382,7 +446,7 @@ def parse_flat_fallback(lines):
         while toks and ALLERGEN_RE.match(toks[-1]): toks.pop()
         name=' '.join(toks).strip()
         if cur_cat and name and len(name)>=3 and cur_cat not in seen_cats:
-            dishes.append({'kategorie':cur_cat,'name':name,'preis_int':price+'\u00a0\u20ac' if price else '','vv':cur_vv,'oder':'','oder_preis':'','oder_vv':''})
+            dishes.append({'kategorie':cur_cat,'name':name,'preis_int':price+'\u00a0\u20ac' if price else '','vv':cur_vv,'oder':'','oder_preis':'','oder_vv':'','zusatz':'','zusatz_preis':''})
             seen_cats.add(cur_cat)
         cur_name=[]; cur_vv=''; after_oder=False; oder_name=[]
     def flush_oder():
@@ -492,68 +556,114 @@ def scrape_day(page, date_obj):
         for i,l in enumerate(lines[:40]): print(f"    {i:3d}: {l[:100]}")
         dishes=parse_flat_fallback(lines)
     for dish in dishes:
+        zusatz_str = f" | zusatz: {dish.get('zusatz','')[:30]!r}" if dish.get('zusatz') else ''
         print(f"  [result] {dish['kategorie']:8s} | vv={dish['vv']!r:3s} | {dish['name'][:35]!r}"
-              +(f" | oder: {dish['oder'][:25]!r} vv={dish.get('oder_vv','')!r}" if dish.get('oder') else ''))
+              +(f" | oder: {dish['oder'][:25]!r} vv={dish.get('oder_vv','')!r}" if dish.get('oder') else '')
+              +zusatz_str)
     return dishes
 
 
 # ── Render helpers ─────────────────────────────────────────────────────────────
 
+def _text_h(draw, text, font, max_w):
+    """Gibt die Gesamthöhe zurück die wrap_text für diesen Text benötigt."""
+    lines = wrap_text(draw, text, font, max_w, max_lines=20)
+    if not lines: return 0
+    b = draw.textbbox((0,0), lines[0], font=font)
+    lh = b[3] - b[1] + 2
+    return lh * len(lines)
+
+
 def _split_long_word(draw, word, font, max_w):
-    """Teilt ein einzelnes Wort mit Bindestrich auf, wenn es breiter als max_w ist.
-    Gibt eine Liste von Teilen zurück (letzter Teil ohne Bindestrich)."""
+    """Teilt ein Wort das breiter als max_w ist mit Bindestrich.
+    Bereits vorhandene Bindestriche werden bevorzugt als Trennstellen genutzt."""
+    # Erst: an vorhandenen Bindestrichen trennen
+    if '-' in word:
+        parts = word.split('-')
+        chunks = []
+        cur = ''
+        for i, part in enumerate(parts):
+            candidate = (cur + '-' + part) if cur else part
+            # Check if candidate + next hyphen fits
+            test = candidate + ('-' if i < len(parts)-1 else '')
+            b = draw.textbbox((0,0), test, font=font)
+            if b[2]-b[0] <= max_w:
+                cur = candidate
+            else:
+                if cur:
+                    chunks.append(cur + '-')
+                cur = part
+        if cur:
+            chunks.append(cur)
+        # Check if any chunk still too wide → recurse on char level
+        result = []
+        for chunk in chunks:
+            b = draw.textbbox((0,0), chunk.rstrip('-'), font=font)
+            if b[2]-b[0] > max_w:
+                result.extend(_split_chars(draw, chunk.rstrip('-'), font, max_w))
+                if chunk.endswith('-') and result:
+                    result[-1] = result[-1].rstrip('-') + '-'
+            else:
+                result.append(chunk)
+        return result
+    return _split_chars(draw, word, font, max_w)
+
+
+def _split_chars(draw, word, font, max_w):
+    """Zeichenweise Silbentrennung mit Bindestrich."""
     parts = []
     while word:
-        # Finde maximale Zeichenanzahl die reinpasst (mit '-' am Ende)
         lo, hi = 1, len(word)
         while lo < hi:
             mid = (lo + hi + 1) // 2
             test = word[:mid] + ('-' if mid < len(word) else '')
-            b = draw.textbbox((0, 0), test, font=font)
-            if b[2] - b[0] <= max_w:
-                lo = mid
-            else:
-                hi = mid - 1
-        if lo <= 0:
-            lo = 1  # Mindestens 1 Zeichen pro Zeile
-        chunk = word[:lo]
-        word  = word[lo:]
+            b = draw.textbbox((0,0), test, font=font)
+            if b[2]-b[0] <= max_w: lo = mid
+            else: hi = mid - 1
+        if lo <= 0: lo = 1
+        chunk = word[:lo]; word = word[lo:]
         parts.append(chunk + ('-' if word else ''))
     return parts
 
 
-def wrap_text(draw, text, f, max_w, max_lines=3):
-    """Bricht Text an Leerzeichen um; zerlegt Wörter die breiter als max_w sind
-    per Bindestrich-Silbentrennung."""
-    # Zuerst: alle Wörter ggf. in Teilwörter splitten
+def wrap_text(draw, text, f, max_w, max_lines=20):
+    """Bricht Text an Leerzeichen um; respektiert vorhandene Bindestriche
+    vor zeichenweiser Silbentrennung."""
     tokens = []
     for word in text.split():
-        b = draw.textbbox((0, 0), word, font=f)
-        if b[2] - b[0] > max_w:
+        b = draw.textbbox((0,0), word, font=f)
+        if b[2]-b[0] > max_w:
             tokens.extend(_split_long_word(draw, word, f, max_w))
         else:
             tokens.append(word)
 
     out, cur = [], []
     for tok in tokens:
-        # Tokens die bereits mit '-' enden (abgetrennte Hälften): eigene Zeile
-        b_tok = draw.textbbox((0, 0), tok, font=f)
-        if tok.endswith('-') and b_tok[2] - b_tok[0] > max_w * 0.5:
-            if cur: out.append(' '.join(cur)); cur = []
-            out.append(tok)
-            continue
         t = ' '.join(cur + [tok])
-        b = draw.textbbox((0, 0), t, font=f)
-        if b[2] - b[0] <= max_w:
+        b = draw.textbbox((0,0), t, font=f)
+        if b[2]-b[0] <= max_w:
             cur.append(tok)
         else:
             if cur: out.append(' '.join(cur))
             cur = [tok]
-        if len(out) >= max_lines - 1 and cur:
-            break
-    if cur:
-        out.append(' '.join(cur))
+    if cur: out.append(' '.join(cur))
     return out[:max_lines]
+
+
+def _fit_font(draw, text, max_w, max_h, size_start=19, size_min=10, bold=False):
+    """Gibt (font, line_height, wrapped_lines) zurück wobei der Text in max_w x max_h passt."""
+    for size in range(size_start, size_min - 1, -1):
+        f = lf(size, bold)
+        lines = wrap_text(draw, text, f, max_w, max_lines=20)
+        if not lines: return f, size+2, lines
+        b = draw.textbbox((0,0), lines[0], font=f)
+        lh = b[3]-b[1]+2
+        if lh * len(lines) <= max_h:
+            return f, lh, lines
+    f = lf(size_min, bold)
+    lines = wrap_text(draw, text, f, max_w, max_lines=20)
+    b = draw.textbbox((0,0), lines[0], font=f) if lines else (0,0,0,size_min)
+    return f, b[3]-b[1]+2, lines
 
 
 def _is_past(day_key_str, today_date):
@@ -580,10 +690,8 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
     ftit  = lf(22, True)
     fdate = lf(13)
     fday  = lf(19, True)
-    ftxt  = lf(19)
-    fsmall= lf(15)
-    fbdg  = lf(14, True)
-    fprc  = lf(16, True)
+    fbdg  = lf(13, True)
+    fprc  = lf(14, True)
     fftr  = lf(11)
     fstb  = lf(11, True)
     fleg  = lf(12)
@@ -593,9 +701,7 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
     LEGEND_H= 22
     STUB_W  = 38
     TODAY_BW= 3
-    LH_TXT  = 23
-    LH_SML  = 19
-    PAD     = 6
+    PAD     = 5
 
     d.rectangle([(0,0),(W,HDR_H)],fill=BLUE)
     friday_date = monday_date + timedelta(4)
@@ -680,37 +786,60 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
                     d.rounded_rectangle([(bx,by),(bx+bw,by+bh)],radius=4,fill=(160,160,160))
                     d.text((bx+4,by+2),'Feiertag',font=fbdg,fill=WHITE)
                     cy=by+bh+5
-                    for ln in wrap_text(d,hn,ftxt,dw-8,3):
-                        b2=d.textbbox((0,0),ln,font=ftxt)
-                        d.text((x+(dw-(b2[2]-b2[0]))//2,cy),ln,font=ftxt,fill=C_HOL_TXT);cy+=LH_TXT
+                    fh,lhh,hlines=_fit_font(d,hn,dw-8,rh-cy+y-4)
+                    for ln in hlines:
+                        b2=d.textbbox((0,0),ln,font=fh)
+                        d.text((x+(dw-(b2[2]-b2[0]))//2,cy),ln,font=fh,fill=C_HOL_TXT);cy+=lhh
                 continue
 
             items=[it for it in week_data.get(day,[]) if it['kategorie']==cat]
             if not items:
-                b=d.textbbox((0,0),'–',font=ftxt)
-                d.text((x+(dw-(b[2]-b[0]))//2,y+rh//2-11),'–',font=ftxt,fill=(180,180,180))
+                b=d.textbbox((0,0),'–',font=lf(19))
+                d.text((x+(dw-(b[2]-b[0]))//2,y+rh//2-11),'–',font=lf(19),fill=(180,180,180))
                 continue
 
-            it=items[0]; cx=x+PAD; cy=y+PAD; avw=dw-2*PAD
+            it=items[0]; avw=dw-2*PAD
+            cy=y+PAD
 
+            # Badge (Vegan/Veg)
             if it['vv']:
                 bl='Vegan' if it['vv']=='VG' else 'Veg.'
                 bc=C_VG if it['vv']=='VG' else C_V
                 b=d.textbbox((0,0),bl,font=fbdg)
-                bw=b[2]-b[0]+8;bh2=b[3]-b[1]+5
-                d.rounded_rectangle([(cx,cy),(cx+bw,cy+bh2)],radius=3,fill=bc)
-                d.text((cx+4,cy+2),bl,font=fbdg,fill=WHITE);cy+=bh2+5
+                bw2=b[2]-b[0]+8;bh2=b[3]-b[1]+4
+                d.rounded_rectangle([(x+PAD,cy),(x+PAD+bw2,cy+bh2)],radius=3,fill=bc)
+                d.text((x+PAD+4,cy+2),bl,font=fbdg,fill=WHITE);cy+=bh2+3
 
-            oder=it.get('oder','')
-            oder_vv=it.get('oder_vv','')
-            space_oder=(LH_SML+6) if oder else 0
-            avail_name=rh-(cy-y)-LH_TXT-space_oder
-            max_ln=max(1,min(3,avail_name//LH_TXT))
-            for ln in wrap_text(d,it['name'],ftxt,avw,max_ln):
-                d.text((cx,cy),ln,font=ftxt,fill=C_TXT);cy+=LH_TXT
+            oder      = it.get('oder','')
+            oder_vv   = it.get('oder_vv','')
+            zusatz    = it.get('zusatz','')
+            zusatz_pr = it.get('zusatz_preis','')
 
+            # Compute price line height
+            pr_h = 0
+            if it['preis_int']:
+                pb = d.textbbox((0,0),f"Int: {it['preis_int']}",font=fprc)
+                pr_h = pb[3]-pb[1]+2
+
+            # Reserve space for oder + zusatz lines (at small font)
+            f_sm = lf(11)
+            b_sm = d.textbbox((0,0),'x',font=f_sm)
+            lh_sm = b_sm[3]-b_sm[1]+2
+            extra_lines = (1 if oder else 0) + (1 if zusatz else 0)
+            reserved = lh_sm * extra_lines + pr_h + 4
+
+            avail_for_name = rh - (cy - y) - reserved
+            if avail_for_name < 12: avail_for_name = 12
+
+            # Adaptive font for main dish name
+            fn, lhn, name_lines = _fit_font(d, it['name'], avw, avail_for_name)
+            for ln in name_lines:
+                d.text((x+PAD, cy), ln, font=fn, fill=C_TXT); cy += lhn
+
+            # oder line (small, adaptive)
             if oder:
-                ocx=cx
+                oder_prefix = ''
+                ocx = x+PAD
                 if oder_vv:
                     obl='Vegan' if oder_vv=='VG' else 'Veg.'
                     obc=C_VG if oder_vv=='VG' else C_V
@@ -718,14 +847,26 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
                     obw=ob[2]-ob[0]+6; obh=ob[3]-ob[1]+4
                     d.rounded_rectangle([(ocx,cy),(ocx+obw,cy+obh)],radius=3,fill=obc)
                     d.text((ocx+3,cy+2),obl,font=fbdg,fill=WHITE)
-                    ocx+=obw+4
-                for ln in wrap_text(d,f"oder: {oder}",fsmall,x+dw-PAD-ocx,2):
-                    d.text((ocx,cy),ln,font=fsmall,fill=(80,120,180));cy+=LH_SML
+                    ocx += obw+3
+                avail_oder = x+dw-PAD-ocx
+                fo,lho,oder_lines=_fit_font(d,f"oder: {oder}",avail_oder,lh_sm*2,size_start=13,size_min=10)
+                for ln in oder_lines:
+                    d.text((ocx,cy),ln,font=fo,fill=(80,120,180));cy+=lho
 
+            # wahlweise-Zusatz line
+            if zusatz:
+                ztext = zusatz
+                if zusatz_pr:
+                    ztext += f"  Int: {zusatz_pr}"
+                fz,lhz,z_lines=_fit_font(d,ztext,avw,lh_sm*2,size_start=12,size_min=10)
+                for ln in z_lines:
+                    d.text((x+PAD,cy),ln,font=fz,fill=C_ZUSATZ);cy+=lhz
+
+            # Price bottom-right
             if it['preis_int']:
                 pl=f"Int: {it['preis_int']}"
                 b=d.textbbox((0,0),pl,font=fprc)
-                d.text((x+dw-(b[2]-b[0])-PAD, y+rh-(b[3]-b[1])-4), pl, font=fprc, fill=LIGHT)
+                d.text((x+dw-(b[2]-b[0])-PAD, y+rh-(b[3]-b[1])-3), pl, font=fprc, fill=LIGHT)
 
             if is_today:
                 d.line([(x,y+rh-1),(x+dw,y+rh-1)],fill=C_TODAY,width=TODAY_BW)
