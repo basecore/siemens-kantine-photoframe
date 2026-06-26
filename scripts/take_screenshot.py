@@ -16,17 +16,17 @@ Scraping strategy (DOM-based, not innerText):
   4. Fallback chain: DOM-query → innerText line-parser (legacy).
   5. WEEK_OFFSET env var (default 1): 0=current week, 1=next week.
      When offset > 0 all days of that week are scraped (no "past" filter).
-  6. Unknown categories (Vegan, Vegetarisch, Fisch, …) map to next free
-     Essen slot (2 or 3) for the current day.
+  6. Unknown categories (Vegan, Vegetarisch, Fisch, …) map to their
+     semantic target slot (Vegan/Veg.→E2, Fisch→E3); only if that slot is
+     already taken do we fall forward to the next free slot.
   7. "wahlweise dazu"-products: the marker product is skipped, the NEXT
      product is stored as 'zusatz' on the main dish.
   8. wrap_text: respects existing hyphens before splitting characters.
   9. render: uniform font size per row (smallest that fits all cells).
- 10. Stub labels drawn last so grid lines don't overwrite them.
- 11. STUB_W=48 so rotated labels are fully visible.
+ 10. Stub labels drawn last as two-line horizontal text (STUB_W=72).
+ 11. Grid lines start at STUB_W (not x=0) so they don't cut through stubs.
  12. line_height uses +4px padding for better readability.
- 13. Grid lines start at STUB_W (not x=0) so they don't cut through stubs.
- 14. No "Int:" prefix on prices – employee price is self-evident.
+ 13. No "Int:" prefix on prices – employee price is self-evident.
 """
 import os, re, json
 from pathlib import Path
@@ -315,6 +315,8 @@ CAT_NORM_FIXED = {
     'essen 2':'Essen 2','food 2':'Essen 2','gericht 2':'Essen 2',
     'essen 3':'Essen 3','food 3':'Essen 3','gericht 3':'Essen 3',
 }
+# Semantic target slot per flexible category.
+# norm_cat() always tries the target first; only falls forward if taken.
 CAT_FLEXIBLE = {
     'fisch':'Essen 3','fish':'Essen 3',
     'vegan':'Essen 2','vegane':'Essen 2',
@@ -330,12 +332,23 @@ def norm_cat(raw, used_cats=None):
         preferred = CAT_FLEXIBLE[key]
         if used_cats is None:
             return preferred
+        # Always try semantic target first, then fall FORWARD only
         try: start_idx = _ESSEN_SLOTS.index(preferred)
-        except ValueError: start_idx = 1
-        for slot in _ESSEN_SLOTS[start_idx:]:
+        except ValueError: start_idx = 0
+        # Try preferred slot first
+        if preferred not in used_cats:
+            return preferred
+        # Slot taken – search forward from preferred position
+        for slot in _ESSEN_SLOTS[start_idx + 1:]:
             if slot not in used_cats:
                 return slot
+        # All slots from preferred onwards taken – try earlier slots as last resort
+        for slot in _ESSEN_SLOTS[:start_idx]:
+            if slot not in used_cats:
+                return slot
+        # Absolute fallback: return preferred even if occupied (render will show last dish)
         return preferred
+    # Unknown category: fill first free Essen slot
     if used_cats is not None:
         for slot in _ESSEN_SLOTS:
             if slot not in used_cats:
@@ -701,7 +714,31 @@ def _is_today(day_key_str, today_date):
     except: return False
 
 CATS=['Suppe','Essen 1','Essen 2','Essen 3']
-CAT_LABEL={'Suppe':'Su.','Essen 1':'E1','Essen 2':'E2','Essen 3':'E3'}
+
+# Two-line stub labels: line1 / line2
+# Drawn as horizontal text inside the blue stub column – no rotation needed.
+CAT_STUB = {
+    'Suppe':   ('Suppe', 'Vor.'),
+    'Essen 1': ('Es.',   '1'),
+    'Essen 2': ('Es.',   '2'),
+    'Essen 3': ('Es.',   '3'),
+}
+
+
+def _draw_stub_label(img, d, cat, x0, y0, stub_w, row_h, font):
+    """Draw a two-line horizontal label centred inside the blue stub area."""
+    line1, line2 = CAT_STUB[cat]
+    b1 = d.textbbox((0, 0), line1, font=font)
+    b2 = d.textbbox((0, 0), line2, font=font)
+    tw1 = b1[2] - b1[0];  th1 = b1[3] - b1[1]
+    tw2 = b2[2] - b2[0];  th2 = b2[3] - b2[1]
+    gap = 2
+    total_h = th1 + gap + th2
+    ty = y0 + (row_h - total_h) // 2
+    # line 1
+    d.text((x0 + (stub_w - tw1) // 2, ty), line1, font=font, fill=WHITE)
+    # line 2
+    d.text((x0 + (stub_w - tw2) // 2, ty + th1 + gap), line2, font=font, fill=WHITE)
 
 
 def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
@@ -715,13 +752,13 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
     fbdg  = lf(13, True)
     fprc  = lf(14, True)
     fftr  = lf(11)
-    fstb  = lf(13, True)   # größer für bessere Lesbarkeit der Stub-Labels
+    fstb  = lf(11, True)   # stub: klein + bold passt in STUB_W=72
     fleg  = lf(12)
 
     HDR_H   = 52
     DAY_H   = 34
     LEGEND_H= 22
-    STUB_W  = 48
+    STUB_W  = 72   # breit genug für 2-zeiligen Horizontal-Text
     TODAY_BW= 3
     PAD     = 5
 
@@ -893,7 +930,7 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
                 for ln in oder_lines:
                     d.text((ocx,cy),ln,font=fo,fill=(80,120,180));cy+=lho
 
-            # wahlweise-Zusatz line (ohne Int-Prefix)
+            # wahlweise-Zusatz line
             if zusatz:
                 ztext = zusatz
                 if zusatz_pr:
@@ -903,7 +940,7 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
                 for ln in z_lines:
                     d.text((x+PAD,cy),ln,font=fz,fill=C_ZUSATZ);cy+=lhz
 
-            # Preis unten rechts – ohne "Int:" Prefix
+            # Preis unten rechts
             if it['preis_int']:
                 b=d.textbbox((0,0),it['preis_int'],font=fprc)
                 d.text((x+dw-(b[2]-b[0])-PAD, y+rh-(b[3]-b[1])-3), it['preis_int'], font=fprc, fill=LIGHT)
@@ -911,18 +948,10 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
             if is_today:
                 d.line([(x,y+rh-1),(x+dw,y+rh-1)],fill=C_TODAY,width=TODAY_BW)
 
-        # ── Stub label drawn LAST (nie von Zellen überschrieben) ──────────
+        # ── Stub: blue background + 2-line horizontal label (drawn LAST) ──
         d.rectangle([(0,y),(STUB_W-1,y+rh-1)],fill=BLUE)
         d.line([(STUB_W,y),(STUB_W,y+rh)],fill=GRID,width=1)
-        lbl=CAT_LABEL[cat]
-        b=d.textbbox((0,0),lbl,font=fstb)
-        tmp=Image.new('RGBA',(b[3]-b[1]+4,b[2]-b[0]+4),(0,0,0,0))
-        td=ImageDraw.Draw(tmp); td.text((2,2),lbl,font=fstb,fill=WHITE)
-        tmp_r=tmp.rotate(90,expand=True)
-        px=(STUB_W-tmp_r.width)//2
-        if px < 0: px = 0
-        py=y+(rh-tmp_r.height)//2
-        img.paste(tmp_r,(px,py),tmp_r)
+        _draw_stub_label(img, d, cat, 0, y, STUB_W, rh, fstb)
 
         y+=rh
 
