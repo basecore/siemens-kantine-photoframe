@@ -139,22 +139,6 @@ def dismiss_cookie(page):
 
 # ── Language switch ────────────────────────────────────────────────────────────
 def switch_to_german(page):
-    """
-    Reliably switch the Angular app to German (de-DE).
-
-    Strategy:
-      1. Snapshot localStorage before any click.
-      2. Try to find & click the language TRIGGER button (the one that opens
-         the mat-menu).  The trigger shows the currently active flag, so for
-         an English session it contains an en-US flag image.  We try several
-         selectors in order of specificity.
-      3. Wait for the mat-menu OVERLAY to be attached to the DOM (Angular
-         renders it lazily; it does NOT exist before the trigger is clicked).
-      4. Click the Deutsch button inside the overlay.
-      5. Wait for German UI confirmation ("Suppe" / "Essen 1" text).
-      6. Capture localStorage diff → _LANG_STORAGE for subsequent _inject()
-         calls.  Fall back to a set of canonical DE keys if the diff is empty.
-    """
     global _LANG_STORAGE
     before = _snap(page)
 
@@ -355,13 +339,15 @@ def parse_dom_result(raw_json):
                 skip_next_as_oder=True; print(f"    [parse] 'oder' separator"); continue
             if main_dish is None:
                 main_dish={'kategorie':cat,'name':name,'preis_int':p['intPrice'],
-                           'vv':vv_from_name(name),'oder':'','oder_preis':''}
+                           'vv':vv_from_name(name),'oder':'','oder_preis':'','oder_vv':''}
                 skip_next_as_oder=False
                 print(f"    [parse] main: {name!r} | Int:{p['intPrice']!r}")
             elif skip_next_as_oder or main_dish['oder']=='':
                 if _names_differ(main_dish['name'],name):
-                    main_dish['oder']=name; main_dish['oder_preis']=p['intPrice']
-                    print(f"    [parse] oder: {name!r}")
+                    main_dish['oder']=name
+                    main_dish['oder_preis']=p['intPrice']
+                    main_dish['oder_vv']=vv_from_name(name)   # ← FIX: Veg-Badge für oder
+                    print(f"    [parse] oder: {name!r} vv={main_dish['oder_vv']!r}")
                 else:
                     print(f"    [parse] skip dup oder: {name!r}")
                 skip_next_as_oder=False
@@ -396,7 +382,7 @@ def parse_flat_fallback(lines):
         while toks and ALLERGEN_RE.match(toks[-1]): toks.pop()
         name=' '.join(toks).strip()
         if cur_cat and name and len(name)>=3 and cur_cat not in seen_cats:
-            dishes.append({'kategorie':cur_cat,'name':name,'preis_int':price+'\u00a0\u20ac' if price else '','vv':cur_vv,'oder':'','oder_preis':''})
+            dishes.append({'kategorie':cur_cat,'name':name,'preis_int':price+'\u00a0\u20ac' if price else '','vv':cur_vv,'oder':'','oder_preis':'','oder_vv':''})
             seen_cats.add(cur_cat)
         cur_name=[]; cur_vv=''; after_oder=False; oder_name=[]
     def flush_oder():
@@ -407,7 +393,9 @@ def parse_flat_fallback(lines):
         if name and len(name)>=3:
             for dish in reversed(dishes):
                 if dish['kategorie']==cur_cat:
-                    if _names_differ(dish['name'],name): dish['oder']=name
+                    if _names_differ(dish['name'],name):
+                        dish['oder']=name
+                        dish['oder_vv']=vv_from_name(name)
                     break
         after_oder=False; oder_name=[]
     VEGAN_LABELS={'Vegan':'VG','Vegetarian':'V','Vegetarisch':'V','vegetarisch':'V'}
@@ -449,7 +437,7 @@ JS_CLICK_TAB=r"""
 })
 """
 JS_TAB_TEXT=r"""
-(function(){var panels=Array.from(document.querySelectorAll('mat-tab-nav-panel,[role="tabpanel"],mat-tab-body'));var active=panels.find(p=>{var s=window.getComputedStyle(p);return s.display!=='none'&&s.visibility!=='hidden'&&p.offsetHeight>0;})||panels[0];if(!active){var b=document.body.cloneNode(true);b.querySelectorAll('script,style,noscript').forEach(e=>e.remove());return b.innerText||b.textContent||'';}return active.innerText||active.textContent||'';})()
+(function(){var panels=Array.from(document.querySelectorAll('mat-tab-nav-panel,[role="tabpanel"],mat-tab-body'));var active=panels.find(p=>{var s=window.getComputedStyle(p);return s.display!=='none'&&s.visibility!=='hidden'&&p.offsetHeight>0;})||panels[0];if(!active){var b=document.body.cloneNode(true);b.querySelectorAll('script,style,noscript').forEach(e=>e.remove());return b.innerText||b.textContent||'';}return active.innerText||active.textContent||'';}())
 """
 
 # ── Scrape one day ────────────────────────────────────────────────────────────
@@ -505,7 +493,7 @@ def scrape_day(page, date_obj):
         dishes=parse_flat_fallback(lines)
     for dish in dishes:
         print(f"  [result] {dish['kategorie']:8s} | vv={dish['vv']!r:3s} | {dish['name'][:35]!r}"
-              +(f" | oder: {dish['oder'][:25]!r}" if dish.get('oder') else ''))
+              +(f" | oder: {dish['oder'][:25]!r} vv={dish.get('oder_vv','')!r}" if dish.get('oder') else ''))
     return dishes
 
 
@@ -536,7 +524,7 @@ def _is_today(day_key_str, today_date):
     except: return False
 
 CATS=['Suppe','Essen 1','Essen 2','Essen 3']
-CAT_LABEL={'Suppe':'Suppe','Essen 1':'Essen 1','Essen 2':'Essen 2','Essen 3':'Essen 3'}
+CAT_LABEL={'Suppe':'Su.','Essen 1':'E1','Essen 2':'E2','Essen 3':'E3'}
 
 
 def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
@@ -544,28 +532,29 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
     img=Image.new('RGB',(W,H),(255,255,255))
     d=ImageDraw.Draw(img)
 
-    # ── Fonts – generously sized for a small 800x600 photo frame ────────────
+    # ── Fonts ────────────────────────────────────────────────────────────────
     ftit  = lf(22, True)   # header title
-    fdate = lf(13)         # date range subtitle in header
-    fday  = lf(19, True)   # day column headers (Mo 23.06 etc.)
+    fdate = lf(13)         # date range subtitle
+    fday  = lf(19, True)   # day column headers
     ftxt  = lf(19)         # main dish name
     fsmall= lf(15)         # oder-alternative
-    fbdg  = lf(15, True)   # vegan/veg badge
-    fprc  = lf(16, True)   # price  ← extra large & bold
+    fbdg  = lf(14, True)   # vegan/veg badge
+    fprc  = lf(16, True)   # price – bold & large
     fftr  = lf(11)         # footer
-    fstb  = lf(15, True)   # row stub label (vertical)
+    fstb  = lf(11, True)   # stub label (fits narrow column at 11pt)
+    fleg  = lf(12)         # legend
 
-    # ── Layout constants ──────────────────────────────────────────────
-    HDR_H   = 52    # header bar height
-    DAY_H   = 34    # day-label row height
-    LEGEND_H= 22    # legend bar height at bottom
-    STUB_W  = 46    # left stub column width
-    TODAY_BW= 3     # gold border width for today column
-    LH_TXT  = 23    # line height for ftxt (19pt)
-    LH_SML  = 19    # line height for fsmall (15pt)
+    # ── Layout ───────────────────────────────────────────────────────────────
+    HDR_H   = 52
+    DAY_H   = 34
+    LEGEND_H= 22
+    STUB_W  = 38   # narrow enough, labels are now abbreviated (Su./E1/E2/E3)
+    TODAY_BW= 3
+    LH_TXT  = 23
+    LH_SML  = 19
     PAD     = 6
 
-    # ── Header ───────────────────────────────────────────────────
+    # ── Header ───────────────────────────────────────────────────────────────
     d.rectangle([(0,0),(W,HDR_H)],fill=BLUE)
     friday_date = monday_date + timedelta(4)
     date_range  = f"{monday_date.strftime('%d.%m.%Y')} – {friday_date.strftime('%d.%m.%Y')}"
@@ -580,7 +569,7 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
     d.text(((W-(bd[2]-bd[0]))//2, ty+title_h+3), date_range, font=fdate, fill=(180,210,240))
     y=HDR_H
 
-    # ── Day header row ────────────────────────────────────────────
+    # ── Day header row ────────────────────────────────────────────────────────
     all_days=list(holiday_map.keys()); dw=(W-STUB_W)//len(all_days)
     d.rectangle([(0,y),(STUB_W-1,y+DAY_H-1)],fill=BLUE)
     for i,day in enumerate(all_days):
@@ -600,24 +589,27 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
             d.line([(x,y),(x+dw,y)],fill=C_TODAY,width=TODAY_BW)
     y+=DAY_H
 
-    # ── Row heights ───────────────────────────────────────────────
+    # ── Row heights ───────────────────────────────────────────────────────────
     avail=H-y-FOOTER_H-LEGEND_H-4
-    rs=int(avail*0.17)          # Suppe: ~17 % of available height
-    re_=(avail-rs)//3           # each Essen row
+    rs=int(avail*0.17)
+    re_=(avail-rs)//3
     ROW_H={'Suppe':rs,'Essen 1':re_,'Essen 2':re_,'Essen 3':avail-rs-2*re_}
 
-    # ── Data rows ─────────────────────────────────────────────────
+    # ── Data rows ─────────────────────────────────────────────────────────────
     for ri,cat in enumerate(CATS):
         rh=ROW_H[cat]
         d.line([(0,y),(W,y)],fill=GRID,width=1)
-        # stub
+
+        # stub – abbreviated label rotated 90°
         d.rectangle([(0,y),(STUB_W-1,y+rh-1)],fill=BLUE)
         lbl=CAT_LABEL[cat]
         b=d.textbbox((0,0),lbl,font=fstb)
         tmp=Image.new('RGBA',(b[3]-b[1]+4,b[2]-b[0]+4),(0,0,0,0))
         td=ImageDraw.Draw(tmp); td.text((2,2),lbl,font=fstb,fill=WHITE)
         tmp_r=tmp.rotate(90,expand=True)
-        img.paste(tmp_r,(max(0,(STUB_W-tmp_r.width)//2),max(y,y+(rh-tmp_r.height)//2)),tmp_r)
+        px=max(0,(STUB_W-tmp_r.width)//2)
+        py=max(y,y+(rh-tmp_r.height)//2)
+        img.paste(tmp_r,(px,py),tmp_r)
 
         for i,day in enumerate(all_days):
             x=STUB_W+i*dw
@@ -662,6 +654,8 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
                 continue
 
             it=items[0]; cx=x+PAD; cy=y+PAD; avw=dw-2*PAD
+
+            # ── main dish vv badge ────────────────────────────────────────────
             if it['vv']:
                 bl='Vegan' if it['vv']=='VG' else 'Veg.'
                 bc=C_VG if it['vv']=='VG' else C_V
@@ -671,14 +665,27 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
                 d.text((cx+4,cy+2),bl,font=fbdg,fill=WHITE);cy+=bh2+5
 
             oder=it.get('oder','')
-            space_oder=(2*LH_SML) if oder else 0
+            oder_vv=it.get('oder_vv','')
+            space_oder=(LH_SML+6) if oder else 0   # 1 line for oder text + badge row
             avail_name=rh-(cy-y)-LH_TXT-space_oder
             max_ln=max(1,min(3,avail_name//LH_TXT))
             for ln in wrap_text(d,it['name'],ftxt,avw,max_ln):
                 d.text((cx,cy),ln,font=ftxt,fill=C_TXT);cy+=LH_TXT
+
+            # ── oder line with optional vv badge ─────────────────────────────
             if oder:
-                for ln in wrap_text(d,f"oder: {oder}",fsmall,avw,2):
-                    d.text((cx,cy),ln,font=fsmall,fill=(80,120,180));cy+=LH_SML
+                ocx=cx
+                if oder_vv:
+                    obl='Vegan' if oder_vv=='VG' else 'Veg.'
+                    obc=C_VG if oder_vv=='VG' else C_V
+                    ob=d.textbbox((0,0),obl,font=fbdg)
+                    obw=ob[2]-ob[0]+6; obh=ob[3]-ob[1]+4
+                    d.rounded_rectangle([(ocx,cy),(ocx+obw,cy+obh)],radius=3,fill=obc)
+                    d.text((ocx+3,cy+2),obl,font=fbdg,fill=WHITE)
+                    ocx+=obw+4
+                for ln in wrap_text(d,f"oder: {oder}",fsmall,x+dw-PAD-ocx,2):
+                    d.text((ocx,cy),ln,font=fsmall,fill=(80,120,180));cy+=LH_SML
+
             if it['preis_int']:
                 pl=f"Int: {it['preis_int']}"
                 b=d.textbbox((0,0),pl,font=fprc)
@@ -688,17 +695,15 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
                 d.line([(x,y+rh-1),(x+dw,y+rh-1)],fill=C_TODAY,width=TODAY_BW)
         y+=rh
 
-    # close today column bottom border
     for i,day in enumerate(all_days):
         if _is_today(day,today_date):
             x=STUB_W+i*dw
             d.line([(x,y),(x+dw,y)],fill=C_TODAY,width=TODAY_BW)
 
-    # ── Legend bar ───────────────────────────────────────────────
+    # ── Legend bar ────────────────────────────────────────────────────────────
     d.line([(0,y),(W,y)],fill=GRID,width=1);y+=1
     d.rectangle([(0,y),(W,y+LEGEND_H)],fill=(245,249,253))
     lx=6
-    fleg=lf(12)   # slightly larger legend font
     for col,txt in [(C_VG,'Vegan'),(C_V,'Vegetarisch'),(C_HOL_HDR,'Feiertag'),
                     (C_PAST_BG,'vergangen'),(C_TODAY,'Heute')]:
         d.rectangle([(lx,y+5),(lx+12,y+15)],fill=col)
@@ -724,8 +729,9 @@ def _footer(d,kw,label,local_dt,f,source=''):
 def main():
     now=datetime.now(timezone.utc); local=german_time(now)
     today_date=local.date()
-    local_monday=local-timedelta(days=local.weekday())
-    target_monday=(local_monday+timedelta(weeks=WEEK_OFFSET)).date()
+    # FIX: weekday() auf dem date-Objekt, nicht auf dem datetime – vermeidet
+    # DST-Verschiebungen die local.weekday() von today_date.weekday() abweichen lassen
+    target_monday=today_date - timedelta(days=today_date.weekday()) + timedelta(weeks=WEEK_OFFSET)
     label,kw=kw_label(datetime.combine(target_monday,datetime.min.time(),tzinfo=timezone.utc))
     out_path=OUT_DIR/f'kantine_{label}.jpg'
     print(f'Week label : {label}  (KW {kw:02d})')
@@ -735,11 +741,11 @@ def main():
     hol_days=[k for k,v in holiday_map.items() if v]
     all_week_dates=[datetime.combine(target_monday+timedelta(i),datetime.min.time(),tzinfo=timezone.utc) for i in range(5)]
     if WEEK_OFFSET==0:
-        scrape_dates=[d for d in all_week_dates if d.date()>=today_date and day_key(d) not in hol_days]
+        scrape_dates=[dt for dt in all_week_dates if dt.date()>=today_date and day_key(dt) not in hol_days]
     else:
-        scrape_dates=[d for d in all_week_dates if day_key(d) not in hol_days]
+        scrape_dates=[dt for dt in all_week_dates if day_key(dt) not in hol_days]
     print(f'Feiertage  : {[(k,holiday_map[k]) for k in hol_days] or "keine"}')
-    print(f'Scraping   : {[day_key(d) for d in scrape_dates]}')
+    print(f'Scraping   : {[day_key(dt) for dt in scrape_dates]}')
     week_data={}
     with sync_playwright() as pw:
         browser=pw.chromium.launch()
