@@ -19,15 +19,27 @@
 
 ---
 
+## Hardware
+
+| Philips 8FF3WMI Bilderrahmen | TP-Link Router (WLAN) |
+|:---:|:---:|
+| <img src="https://raw.githubusercontent.com/basecore/kicktipp-photoframe/3dced20f3089dd632787516a95a9d18826b24cb2/sources/IMG/frame.jpg" width="280"> | <img src="https://raw.githubusercontent.com/basecore/siemens-kantine-photoframe/main/sources/IMG/router.jpg" width="280"> |
+
+- **Bilderrahmen:** Philips 8FF3WMI, 800 × 600 px, RSS-Feed-Unterstützung
+- **Netzwerk:** Der Rahmen hängt per WLAN am TP-Link Router
+- **Aktualisierung:** Das Bild wird täglich um 02:00 Uhr (deutsche Zeit) automatisch aktualisiert
+
+---
+
 ## Automatischer Zeitplan
 
 | Zeitpunkt | Uhrzeit (DE) | Aktion |
 |-----------|-------------|--------|
 | Täglich | 02:00 Uhr | Aktuelle Woche neu generieren (korrekter Tagesstatus) |
-| Do + Fr | 16:00 Uhr | Nächste Woche vorabladen |
+| Freitag | 12:00 Uhr | Nächste Woche vorabladen |
 | Manuell | jederzeit | Workflow Dispatch mit `week_offset` 0 oder 1 |
 
-> Das Nachtupdate um 02:00 Uhr stellt sicher, dass vergangene Tage korrekt als "vergangen" markiert sind und das Bild immer den aktuellen Stand widerspiegelt.
+> Das Nachtupdate um 02:00 Uhr stellt sicher, dass vergangene Tage korrekt als „vergangen“ markiert sind und das Bild immer den aktuellen Stand widerspiegelt. Ab Freitag 12:00 Uhr ist die nächste Woche bereits verfügbar.
 
 ---
 
@@ -37,7 +49,7 @@
 - **Kategorien:** Suppe / Essen 1 / Essen 2 / Essen 3
 - **Badges:** Vegan, Vegetarisch
 - **Alternativen:** `oder` nur bei explizitem Portal-Separator, sonst `mit`
-- **Zusatz:** wahlweise-Beilagen (z. B. Parmesan mit Preis)
+- **Zusatz:** wahlweise-Beilagen (z. B. Parmesan mit Preis)
 - **Feiertage:** Bayerische Feiertage werden erkannt und angezeigt
 - **Heute:** Aktueller Tag wird golden hervorgehoben
 - **Vergangene Tage:** Werden grau ausgegraut
@@ -50,15 +62,18 @@
 ```
 .github/
   workflows/
-    screenshot.yml      # GitHub Actions Workflow
+    screenshot.yml       # GitHub Actions Workflow
 scripts/
-  take_screenshot.py   # Scraping + Rendering
-  generate_rss.py      # RSS-Feed Generierung
+  take_screenshot.py    # Scraping + Rendering
+  generate_rss.py       # RSS-Feed Generierung
 docs/
   images/
-    latest.jpg         # Aktuellstes Bild (symlink-äquivalent)
-    kantine_YYYY-WNN.jpg  # Archiv (max. 8 Bilder)
-  feed.xml             # RSS-Feed
+    latest.jpg          # Aktuellstes Bild
+    kantine_YYYY-WNN.jpg   # Archiv (max. 8 Bilder)
+  feed.xml              # RSS-Feed
+sources/
+  IMG/
+    router.jpg          # Hardware-Foto TP-Link Router
 ```
 
 ---
@@ -145,12 +160,3 @@ Value: <deine Session-ID>
 | Essen 1 / Food 1 | Essen 1 (E1) |
 | Essen 2 / Vegan / Vegetarisch | Essen 2 (E2) |
 | Essen 3 / Fisch | Essen 3 (E3) |
-
----
-
-## Hardware
-
-**Philips 8FF3WMI Digital Photo Frame**
-- Auflösung: 800 × 600 px
-- RSS-Feed-Unterstützung für automatische Bildaktualisierung
-- Das Bild wird täglich um 02:00 Uhr (deutsche Zeit) aktualisiert
