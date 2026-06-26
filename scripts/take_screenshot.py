@@ -23,7 +23,7 @@ Scraping strategy (DOM-based, not innerText):
      product is stored as 'zusatz' on the main dish.
   8. wrap_text: respects existing hyphens before splitting characters.
   9. render: uniform font size per row (smallest that fits all cells).
- 10. Stub labels drawn last as two-line horizontal text (STUB_W=72).
+ 10. Stub labels drawn last as single-line horizontal text (STUB_W=72).
  11. Grid lines start at STUB_W (not x=0) so they don't cut through stubs.
  12. line_height uses +4px padding for better readability.
  13. No "Int:" prefix on prices – employee price is self-evident.
@@ -332,23 +332,17 @@ def norm_cat(raw, used_cats=None):
         preferred = CAT_FLEXIBLE[key]
         if used_cats is None:
             return preferred
-        # Always try semantic target first, then fall FORWARD only
         try: start_idx = _ESSEN_SLOTS.index(preferred)
         except ValueError: start_idx = 0
-        # Try preferred slot first
         if preferred not in used_cats:
             return preferred
-        # Slot taken – search forward from preferred position
         for slot in _ESSEN_SLOTS[start_idx + 1:]:
             if slot not in used_cats:
                 return slot
-        # All slots from preferred onwards taken – try earlier slots as last resort
         for slot in _ESSEN_SLOTS[:start_idx]:
             if slot not in used_cats:
                 return slot
-        # Absolute fallback: return preferred even if occupied (render will show last dish)
         return preferred
-    # Unknown category: fill first free Essen slot
     if used_cats is not None:
         for slot in _ESSEN_SLOTS:
             if slot not in used_cats:
@@ -401,7 +395,6 @@ def parse_dom_result(raw_json):
         for p in prods:
             name=p['name'].strip().replace('\n',' / ')
 
-            # ── wahlweise handling ──────────────────────────────────────────
             if WAHLWEISE_RE.match(name):
                 remainder = WAHLWEISE_RE.sub('', name).strip()
                 if remainder and main_dish is not None:
@@ -421,13 +414,11 @@ def parse_dom_result(raw_json):
                 next_is_zusatz = False
                 continue
 
-            # ── explicit oder separator ─────────────────────────────────────
             if re.match(r'^(oder|or)$', name.strip(), re.IGNORECASE):
                 explicit_oder = True
                 print(f"    [parse] 'oder' separator")
                 continue
 
-            # ── main dish or alternative ────────────────────────────────────
             if main_dish is None:
                 vv = vv_from_name(name) or cat_vv
                 main_dish={'kategorie':cat,'name':name,'preis_int':p['intPrice'],
@@ -665,13 +656,11 @@ def wrap_text(draw, text, f, max_w, max_lines=20):
 
 
 def _line_h(draw, font):
-    """Line height with comfortable +4px padding."""
     b = draw.textbbox((0,0), 'Ag', font=font)
     return b[3] - b[1] + 4
 
 
 def _find_uniform_font_size(draw, texts, max_w, max_h, size_start=19, size_min=10, bold=False):
-    """Find the largest font size where ALL texts fit within max_w x max_h."""
     for size in range(size_start, size_min - 1, -1):
         f = lf(size, bold)
         lh = _line_h(draw, f)
@@ -689,7 +678,6 @@ def _find_uniform_font_size(draw, texts, max_w, max_h, size_start=19, size_min=1
 
 
 def _fit_font(draw, text, max_w, max_h, size_start=19, size_min=10, bold=False):
-    """Returns (font, line_height, wrapped_lines) that fit in max_w x max_h."""
     for size in range(size_start, size_min - 1, -1):
         f = lf(size, bold)
         lh = _line_h(draw, f)
@@ -715,30 +703,35 @@ def _is_today(day_key_str, today_date):
 
 CATS=['Suppe','Essen 1','Essen 2','Essen 3']
 
-# Two-line stub labels: line1 / line2
-# Drawn as horizontal text inside the blue stub column – no rotation needed.
+# Single-line stub labels drawn horizontally inside the blue stub column.
 CAT_STUB = {
-    'Suppe':   ('Suppe', 'Vor.'),
-    'Essen 1': ('Es.',   '1'),
-    'Essen 2': ('Es.',   '2'),
-    'Essen 3': ('Es.',   '3'),
+    'Suppe':   'Vorspeise',
+    'Essen 1': 'Essen 1',
+    'Essen 2': 'Essen 2',
+    'Essen 3': 'Essen 3',
 }
 
 
-def _draw_stub_label(img, d, cat, x0, y0, stub_w, row_h, font):
-    """Draw a two-line horizontal label centred inside the blue stub area."""
-    line1, line2 = CAT_STUB[cat]
-    b1 = d.textbbox((0, 0), line1, font=font)
-    b2 = d.textbbox((0, 0), line2, font=font)
-    tw1 = b1[2] - b1[0];  th1 = b1[3] - b1[1]
-    tw2 = b2[2] - b2[0];  th2 = b2[3] - b2[1]
-    gap = 2
-    total_h = th1 + gap + th2
-    ty = y0 + (row_h - total_h) // 2
-    # line 1
-    d.text((x0 + (stub_w - tw1) // 2, ty), line1, font=font, fill=WHITE)
-    # line 2
-    d.text((x0 + (stub_w - tw2) // 2, ty + th1 + gap), line2, font=font, fill=WHITE)
+def _draw_stub_label(d, cat, x0, y0, stub_w, row_h, font):
+    """Draw a single-line horizontal label centred inside the blue stub area.
+    If the label is too wide, shrink font size until it fits."""
+    label = CAT_STUB[cat]
+    # Try to fit; shrink font if needed
+    for size in range(11, 6, -1):
+        f = lf(size, bold=True)
+        b = d.textbbox((0, 0), label, font=f)
+        tw = b[2] - b[0]
+        th = b[3] - b[1]
+        if tw <= stub_w - 4:
+            tx = x0 + (stub_w - tw) // 2
+            ty = y0 + (row_h - th) // 2
+            d.text((tx, ty), label, font=f, fill=WHITE)
+            return
+    # absolute fallback at size 6
+    f = lf(6, bold=True)
+    b = d.textbbox((0, 0), label, font=f)
+    tw = b[2] - b[0]; th = b[3] - b[1]
+    d.text((x0 + (stub_w - tw) // 2, y0 + (row_h - th) // 2), label, font=f, fill=WHITE)
 
 
 def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
@@ -752,13 +745,12 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
     fbdg  = lf(13, True)
     fprc  = lf(14, True)
     fftr  = lf(11)
-    fstb  = lf(11, True)   # stub: klein + bold passt in STUB_W=72
     fleg  = lf(12)
 
     HDR_H   = 52
     DAY_H   = 34
     LEGEND_H= 22
-    STUB_W  = 72   # breit genug für 2-zeiligen Horizontal-Text
+    STUB_W  = 72   # wide enough for "Vorspeise" at size 9–10 bold
     TODAY_BW= 3
     PAD     = 5
 
@@ -805,12 +797,9 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
     # ── rows ──────────────────────────────────────────────────────────────────
     for ri,cat in enumerate(CATS):
         rh=ROW_H[cat]
-        # Grid-Trennlinie nur ab STUB_W – nie durch den Stub-Bereich
         d.line([(STUB_W,y),(W,y)],fill=GRID,width=1)
 
         avw = dw - 2*PAD
-
-        # ── Pre-pass: uniform font size for entire row ────────────────────
         f_sm = lf(11)
         lh_sm = _line_h(d, f_sm)
 
@@ -845,7 +834,6 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
         fn_uniform = lf(uniform_size)
         lhn_uniform = _line_h(d, fn_uniform)
 
-        # ── Draw each day cell ────────────────────────────────────────────
         for i,day in enumerate(all_days):
             x=STUB_W+i*dw
             is_hol  = holiday_map[day] is not None
@@ -892,7 +880,6 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
             it=items[0]
             cy=y+PAD
 
-            # Badge
             if it['vv']:
                 bl='Vegan' if it['vv']=='VG' else 'Veg.'
                 bc=C_VG if it['vv']=='VG' else C_V
@@ -907,12 +894,10 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
             zusatz      = it.get('zusatz','')
             zusatz_pr   = it.get('zusatz_preis','')
 
-            # Main dish name with uniform font
             name_lines = wrap_text(d, it['name'], fn_uniform, avw, max_lines=20)
             for ln in name_lines:
                 d.text((x+PAD, cy), ln, font=fn_uniform, fill=C_TXT); cy += lhn_uniform
 
-            # oder/mit line
             if oder:
                 ocx = x+PAD
                 if oder_vv:
@@ -930,7 +915,6 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
                 for ln in oder_lines:
                     d.text((ocx,cy),ln,font=fo,fill=(80,120,180));cy+=lho
 
-            # wahlweise-Zusatz line
             if zusatz:
                 ztext = zusatz
                 if zusatz_pr:
@@ -940,7 +924,6 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
                 for ln in z_lines:
                     d.text((x+PAD,cy),ln,font=fz,fill=C_ZUSATZ);cy+=lhz
 
-            # Preis unten rechts
             if it['preis_int']:
                 b=d.textbbox((0,0),it['preis_int'],font=fprc)
                 d.text((x+dw-(b[2]-b[0])-PAD, y+rh-(b[3]-b[1])-3), it['preis_int'], font=fprc, fill=LIGHT)
@@ -948,10 +931,10 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
             if is_today:
                 d.line([(x,y+rh-1),(x+dw,y+rh-1)],fill=C_TODAY,width=TODAY_BW)
 
-        # ── Stub: blue background + 2-line horizontal label (drawn LAST) ──
+        # ── Stub: blue background + single-line label (drawn LAST) ────────
         d.rectangle([(0,y),(STUB_W-1,y+rh-1)],fill=BLUE)
         d.line([(STUB_W,y),(STUB_W,y+rh)],fill=GRID,width=1)
-        _draw_stub_label(img, d, cat, 0, y, STUB_W, rh, fstb)
+        _draw_stub_label(d, cat, 0, y, STUB_W, rh, None)
 
         y+=rh
 
