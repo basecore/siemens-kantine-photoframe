@@ -139,78 +139,194 @@ def dismiss_cookie(page):
 
 # ── Language switch ────────────────────────────────────────────────────────────
 def switch_to_german(page):
+    """
+    Reliably switch the Angular app to German (de-DE).
+
+    Strategy:
+      1. Snapshot localStorage before any click.
+      2. Try to find & click the language TRIGGER button (the one that opens
+         the mat-menu).  The trigger shows the currently active flag, so for
+         an English session it contains an en-US flag image.  We try several
+         selectors in order of specificity.
+      3. Wait for the mat-menu OVERLAY to be attached to the DOM (Angular
+         renders it lazily; it does NOT exist before the trigger is clicked).
+      4. Click the Deutsch button inside the overlay.
+      5. Wait for German UI confirmation ("Suppe" / "Essen 1" text).
+      6. Capture localStorage diff → _LANG_STORAGE for subsequent _inject()
+         calls.  Fall back to a set of canonical DE keys if the diff is empty.
+    """
     global _LANG_STORAGE
     before = _snap(page)
 
+    # ── Step 1: selectors for the TRIGGER button (opens the language menu) ──
+    # Ordered from most specific to broadest.
     TRIGGER_SELS = [
-        "button[aria-label='language']", "button[aria-label='Language']",
-        "button[aria-label*='language' i]", "button[aria-label*='sprache' i]",
-        "button:has-text('English')", "button:has-text('EN')",
-        "mat-select[aria-label*='lang' i]", "button:has(img[src*='flags'])",
-    ]
-    DE_SELS = [
-        "button[value='de-DE']", "button[aria-label='Deutsch']",
-        "button[lang='de-DE']", "[aria-label='Deutsch']", "img[src*='de-DE']",
+        # explicit aria-label on the trigger
+        "button[aria-label='language']",
+        "button[aria-label='Language']",
+        "button[aria-label*='language' i]",
+        "button[aria-label*='sprache' i]",
+        # trigger shows the current-language flag image inside a button
+        "button:has(img[src*='flags/'])",
+        "button:has(img[src*='en-US'])",
+        "button:has(img[alt='English'])",
+        "button:has(img[title='English'])",
+        # text-based fallbacks
+        "button:has-text('English')",
+        "button:has-text('EN')",
+        # mat-select (some portal variants)
+        "mat-select[aria-label*='lang' i]",
     ]
 
-    def _click_de():
+    # ── Step 2: selectors for the DE button INSIDE the open mat-menu ──
+    # These elements only exist in the DOM after the trigger has been clicked.
+    DE_SELS = [
+        "button[aria-label='Deutsch']",
+        "button[lang='de-DE']",
+        "button[value='de-DE']",
+        "[role='menuitem'][aria-label='Deutsch']",
+        "[role='menuitem'][lang='de-DE']",
+    ]
+
+    # ── Helper: wait for mat-menu overlay, then click DE ──────────────────
+    def _wait_for_menu_and_click_de():
+        """
+        After the trigger click, Angular attaches the mat-menu panel to the
+        document body (as <div class="mat-mdc-menu-panel"> or similar).
+        We wait for it to appear, then look for the Deutsch button inside it.
+        """
+        OVERLAY_SELS = [
+            ".mat-mdc-menu-panel",
+            ".mat-menu-panel",
+            "[class*='mat-menu']",
+            "div[role='menu']",
+        ]
+        overlay_found = False
+        for osel in OVERLAY_SELS:
+            try:
+                page.wait_for_selector(osel, timeout=3000, state="attached")
+                print(f"  [lang] mat-menu overlay found via {osel!r}")
+                overlay_found = True
+                break
+            except: pass
+        if not overlay_found:
+            print("  [lang] mat-menu overlay not detected, trying DE button anyway")
+
+        # Now try to click the DE button (it should be visible in the overlay)
         for sel in DE_SELS:
             try:
-                el=page.wait_for_selector(sel, timeout=2500, state="visible")
+                el = page.wait_for_selector(sel, timeout=3000, state="visible")
                 if el:
-                    tag=page.evaluate("(el)=>el.tagName", el)
-                    if tag=='IMG':
-                        page.evaluate("(el)=>{var b=el.closest('button,a')||el;b.click();}", el)
-                    else: el.click()
-                    print(f"  [lang] ✓ clicked DE via {sel!r}"); return True
+                    el.click()
+                    print(f"  [lang] ✓ clicked DE button via {sel!r}")
+                    return True
             except: pass
-        return False
 
-    if _click_de():
-        pass
-    else:
-        print("  [lang] DE button not visible, trying trigger buttons...")
-        opened=False
+        # Last-resort JS click on the flag image parent button
+        print("  [lang] DE selectors failed, trying JS click on de-DE flag img...")
+        result = page.evaluate(r"""
+        (function(){
+          var img = document.querySelector(
+            "img[src*='de-DE'], img[alt='Deutsch'], img[title='Deutsch']"
+          );
+          if (!img) return 'de-DE img not found';
+          var btn = img.closest('button,[role="menuitem"],[role="option"],a')
+                    || img.parentElement;
+          btn.click();
+          return 'JS-clicked: ' + btn.tagName + ' | ' + (img.src || '');
+        })()
+        """)
+        print(f"  [lang] JS fallback result: {result}")
+        return "not found" not in result
+
+    # ── Step 3: attempt language switch ──────────────────────────────────
+    switched = False
+
+    # First check if the DE button is already directly visible (no trigger needed)
+    for sel in DE_SELS:
+        try:
+            el = page.wait_for_selector(sel, timeout=800, state="visible")
+            if el:
+                el.click()
+                print(f"  [lang] ✓ DE button already visible, clicked via {sel!r}")
+                switched = True
+                break
+        except: pass
+
+    if not switched:
+        print("  [lang] DE button not directly visible – opening language trigger...")
+        trigger_opened = False
         for tsel in TRIGGER_SELS:
             try:
                 page.click(tsel, timeout=2500)
-                print(f"  [lang] opened language menu via {tsel!r}")
-                page.wait_for_timeout(700); opened=True; break
+                print(f"  [lang] ✓ trigger clicked via {tsel!r}")
+                page.wait_for_timeout(600)
+                trigger_opened = True
+                break
             except: pass
-        if not opened:
-            print("  [lang] trigger not found, trying flag img JS click...")
-            result=page.evaluate(r"""
+
+        if not trigger_opened:
+            # Absolute fallback: JS-click any button containing a flags/ image
+            print("  [lang] no trigger selector matched, trying JS flag-button click...")
+            result = page.evaluate(r"""
             (function(){
-              var img=document.querySelector("img[src*='de-DE'],img[alt='Deutsch'],img[title='Deutsch']");
-              if(!img)return 'img not found';
-              var btn=img.closest('button,a,[role=menuitem],[role=option]')||img.parentElement;
-              btn.click();return 'clicked:'+btn.tagName+'|'+(img.src||'');
+              var imgs = Array.from(document.querySelectorAll("img[src*='flags/']"));
+              for (var img of imgs) {
+                var btn = img.closest('button,[role="button"]') || img.parentElement;
+                if (btn && btn !== img) {
+                  btn.click();
+                  return 'JS trigger clicked: ' + btn.tagName + ' | ' + (img.src || '');
+                }
+              }
+              return 'no flags img found';
             })()
             """)
-            print(f"  [lang] JS fallback: {result}")
-            page.wait_for_timeout(700)
-        if not _click_de():
-            print("  [lang] ✗ WARNING: could not switch to German – will be in English")
-            return False
+            print(f"  [lang] JS trigger fallback: {result}")
+            page.wait_for_timeout(600)
 
-    page.wait_for_timeout(1200)
-    after=_snap(page)
-    diff={k:v for k,v in after.items() if before.get(k)!=v}
-    if diff:
-        _LANG_STORAGE=diff
-        print(f"  [lang] localStorage diff: {dict(diff)}")
-    else:
-        _LANG_STORAGE={k:'de' for k in
-            ['language','locale','lang','i18n','selectedLanguage','appLanguage',
-             'selectedLocale','userLanguage','NG_TRANSLATE_LANG_KEY']}
-        print("  [lang] no diff – injecting fallback keys")
-    for de_sel in ["text=Suppe / Vorspeise","text=Suppe","text=Essen 1","h3.category-header"]:
+        switched = _wait_for_menu_and_click_de()
+
+    if not switched:
+        print("  [lang] ✗ WARNING: could not switch to German – proceeding in English")
+        return False
+
+    # ── Step 4: wait for German UI confirmation ───────────────────────────
+    page.wait_for_timeout(1000)
+    confirmed = False
+    for de_text_sel in [
+        "text=Suppe / Vorspeise", "text=Suppe", "text=Essen 1",
+        "h3.category-header", "text=Mittagessen",
+    ]:
         try:
-            page.wait_for_selector(de_sel, timeout=3000)
-            print(f"  [lang] German UI confirmed via {de_sel!r}"); return True
+            page.wait_for_selector(de_text_sel, timeout=3500)
+            print(f"  [lang] ✓ German UI confirmed via {de_text_sel!r}")
+            confirmed = True
+            break
         except: pass
-    print("  [lang] German UI not yet confirmed")
-    return False
+    if not confirmed:
+        print("  [lang] German UI not yet confirmed (may appear after navigation)")
+
+    # ── Step 5: capture localStorage diff for re-injection ───────────────
+    after = _snap(page)
+    diff  = {k: v for k, v in after.items() if before.get(k) != v}
+    if diff:
+        _LANG_STORAGE = diff
+        print(f"  [lang] localStorage diff captured: {dict(diff)}")
+    else:
+        # No diff: inject a broad set of canonical DE language keys.
+        # One of them will usually be the key the app actually reads.
+        _LANG_STORAGE = {k: 'de-DE' for k in [
+            'language', 'locale', 'lang', 'i18n',
+            'selectedLanguage', 'appLanguage', 'selectedLocale',
+            'userLanguage', 'NG_TRANSLATE_LANG_KEY',
+        ]}
+        _LANG_STORAGE.update({k: 'de' for k in [
+            'language', 'locale', 'lang',
+        ]})
+        print(f"  [lang] no localStorage diff – injecting {len(_LANG_STORAGE)} fallback keys")
+
+    return confirmed or switched
+
 
 def warmup(page, base_url):
     print("[warmup] Loading base URL...")
@@ -284,7 +400,7 @@ def _dedup_products(prods):
     return out
 
 def _names_differ(a, b):
-    def norm(s): return re.sub(r'[\s"\'\u00ab\u00bb\u201e\u201c]+','',s).lower()
+    def norm(s): return re.sub(r'[\s"\'«»„"]+','',s).lower()
     return norm(a)!=norm(b)
 
 def parse_dom_result(raw_json):
@@ -323,7 +439,7 @@ ALLERGEN_RE=re.compile(r'^[A-Z]{1,10}$')
 OR_RE=re.compile(r'^(oder|or)$',re.IGNORECASE)
 EXT_RE=re.compile(r'^Ext[\s\u00a0]',re.IGNORECASE)
 CAT_HEADERS_FB={'Soup / Starter':'Suppe','Soup/Starter':'Suppe','Soup':'Suppe','Suppe / Vorspeise':'Suppe','Suppe/Vorspeise':'Suppe','Suppe':'Suppe','Food 1':'Essen 1','Food 2':'Essen 2','Food 3':'Essen 3','Essen 1':'Essen 1','Essen 2':'Essen 2','Essen 3':'Essen 3','Gericht 1':'Essen 1','Gericht 2':'Essen 2','Gericht 3':'Essen 3','Fish':'Essen 3','Fisch':'Essen 3'}
-NOISE_FB={'Learn more','Got it!','home','Home','view_compact','Menu','place','Stores','Impressum','close','Close','English','Lunch','filter_list','Filter','Store','clear','Info','MyCasinoCard','Opening hours','Nutzungsbedingungen','Datenschutzerkl\u00e4rung','Speiseplan','Mittagessen','Informationen','Deutsch','Mehr erfahren','note','Aktuelle Woche'}
+NOISE_FB={'Learn more','Got it!','home','Home','view_compact','Menu','place','Stores','Impressum','close','Close','English','Lunch','filter_list','Filter','Store','clear','Info','MyCasinoCard','Opening hours','Nutzungsbedingungen','Datenschutzerklärung','Speiseplan','Mittagessen','Informationen','Deutsch','Mehr erfahren','note','Aktuelle Woche'}
 
 def _norm_price(raw):
     try: return f"{float(raw.replace(',','.')):.2f}".replace('.',',')
@@ -492,7 +608,7 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
     img=Image.new('RGB',(W,H),(255,255,255))
     d=ImageDraw.Draw(img)
     ftit  = lf(20, True)
-    fdate = lf(14)          # date range in header
+    fdate = lf(14)
     fday  = lf(17, True)
     ftxt  = lf(17)
     fsmall= lf(14)
@@ -502,9 +618,8 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
     fstb  = lf(13, True)
 
     HDR_H=56; DAY_H=30; LEGEND_H=24; STUB_W=60
-    TODAY_BW=3   # border width for today highlight
+    TODAY_BW=3
 
-    # ── Header: title + date range ──
     d.rectangle([(0,0),(W,HDR_H)],fill=BLUE)
     friday_date = monday_date + timedelta(4)
     date_range  = f"{monday_date.strftime('%d.%m.%Y')} – {friday_date.strftime('%d.%m.%Y')}"
@@ -526,19 +641,14 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
         is_hol  = holiday_map[day] is not None
         is_past = _is_past(day, today_date)
         is_today= _is_today(day, today_date)
-        if is_today:
-            col = C_TODAY_HDR
-        elif is_hol:
-            col = C_HOL_HDR
-        elif is_past:
-            col = C_PAST_TXT
-        else:
-            col = LIGHT
+        if is_today:    col = C_TODAY_HDR
+        elif is_hol:    col = C_HOL_HDR
+        elif is_past:   col = C_PAST_TXT
+        else:           col = LIGHT
         d.rectangle([(x,y),(x+dw-1,y+DAY_H-1)],fill=col)
         b=d.textbbox((0,0),day,font=fday)
         d.text((x+(dw-(b[2]-b[0]))//2,y+(DAY_H-(b[3]-b[1]))//2),day,font=fday,fill=WHITE)
         d.line([(x,y),(x,y+DAY_H)],fill=BLUE,width=1)
-        # Today: draw a gold top border line
         if is_today:
             d.line([(x,y),(x+dw,y)],fill=C_TODAY,width=TODAY_BW)
     y+=DAY_H
@@ -550,7 +660,6 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
     for ri,cat in enumerate(CATS):
         rh=ROW_H[cat]
         d.line([(0,y),(W,y)],fill=GRID,width=1)
-        # row stub
         d.rectangle([(0,y),(STUB_W-1,y+rh-1)],fill=BLUE)
         lbl=CAT_LABEL[cat]
         b=d.textbbox((0,0),lbl,font=fstb)
@@ -565,19 +674,13 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
             is_past = _is_past(day, today_date)
             is_today= _is_today(day, today_date)
 
-            if is_past:
-                bg = C_PAST_BG
-            elif is_hol:
-                bg = C_HOL_BG
-            elif is_today:
-                bg = (255, 253, 230)   # very light gold tint
-            else:
-                bg = R_ODD if ri%2==0 else R_EVEN
+            if is_past:         bg = C_PAST_BG
+            elif is_hol:        bg = C_HOL_BG
+            elif is_today:      bg = (255, 253, 230)
+            else:               bg = R_ODD if ri%2==0 else R_EVEN
 
             d.rectangle([(x,y),(x+dw-1,y+rh-1)],fill=bg)
             d.line([(x,y),(x,y+rh)],fill=GRID,width=1)
-
-            # Today: left+right gold border lines through entire column
             if is_today:
                 d.line([(x,y),(x,y+rh)],fill=C_TODAY,width=TODAY_BW)
                 d.line([(x+dw-1,y),(x+dw-1,y+rh)],fill=C_TODAY,width=TODAY_BW)
@@ -631,12 +734,10 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
                 b=d.textbbox((0,0),pl,font=fprc)
                 d.text((x+dw-(b[2]-b[0])-PAD,y+rh-(b[3]-b[1])-4),pl,font=fprc,fill=LIGHT)
 
-            # Today: bottom gold border line per cell
             if is_today:
                 d.line([(x,y+rh-1),(x+dw,y+rh-1)],fill=C_TODAY,width=TODAY_BW)
         y+=rh
 
-    # After last row: close today border at bottom
     for i,day in enumerate(all_days):
         if _is_today(day,today_date):
             x=STUB_W+i*dw
