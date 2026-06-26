@@ -1,10 +1,17 @@
-name: Weekly Kantine Screenshot
+name: Kantine Screenshot
 
 on:
   workflow_dispatch:
+    inputs:
+      week_offset:
+        description: '0 = current week, 1 = next week'
+        required: false
+        default: '0'
   schedule:
-    # Jeden Montag 05:30 UTC = 07:30 CEST
-    - cron: '30 5 * * 1'
+    # Mo-Fr 05:30 UTC = 07:30 CEST  → aktuelle Woche (verbleibende Tage)
+    - cron: '30 5 * * 1-5'
+    # Do + Fr 14:00 UTC = 16:00 CEST  → nächste Woche vorabladen
+    - cron: '0 14 * * 4,5'
 
 permissions:
   contents: write
@@ -21,15 +28,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Determine WEEK_OFFSET
+        id: offset
+        run: |
+          # workflow_dispatch: use input
+          # schedule 14:00 Thu/Fri: next week
+          # schedule 05:30 Mon-Fri: current week
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "WEEK_OFFSET=${{ github.event.inputs.week_offset }}" >> $GITHUB_ENV
+          elif [ "$(date -u +%H)" -ge 12 ]; then
+            echo "WEEK_OFFSET=1" >> $GITHUB_ENV
+          else
+            echo "WEEK_OFFSET=0" >> $GITHUB_ENV
+          fi
+
       - name: Install dependencies
         run: |
           sudo apt-get update -q
-          sudo apt-get install -yq chromium-browser fonts-dejavu curl
-          pip install playwright Pillow requests pdfplumber pypdf beautifulsoup4 lxml
+          sudo apt-get install -yq chromium-browser fonts-dejavu fonts-liberation
+          pip install playwright Pillow
           python -m playwright install chromium
           python -m playwright install-deps chromium
 
-      - name: Scrape PDF & render menu
+      - name: Scrape & render menu
         id: screenshot
         run: python scripts/take_screenshot.py
 
@@ -40,24 +61,26 @@ jobs:
       - name: Update latest.jpg
         if: steps.screenshot.outcome == 'success'
         run: |
-          LATEST=$(ls -t docs/images/kantine_*.jpg | head -1)
-          cp "$LATEST" docs/images/latest.jpg
-          echo "latest.jpg updated from: $LATEST"
+          LATEST=$(ls -t docs/images/kantine_*.jpg 2>/dev/null | head -1)
+          if [ -n "$LATEST" ]; then
+            cp "$LATEST" docs/images/latest.jpg
+            echo "latest.jpg ← $LATEST"
+          fi
 
-      - name: Commit and push to GitHub
+      - name: Commit and push
         if: steps.screenshot.outcome == 'success'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add docs/
-          git diff --cached --quiet || git commit -m "chore: weekly kantine screenshot update $(date -u +%Y-%m-%d)"
+          git diff --cached --quiet || git commit -m "chore: kantine update $(date -u +%Y-%m-%d) KW-OFFSET=$WEEK_OFFSET"
           git pull --rebase origin main
           git push
 
-      - name: Upload image as artifact
+      - name: Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kantine-screenshot-debug
+          name: kantine-debug-${{ github.run_number }}
           path: docs/images/
           retention-days: 10
