@@ -23,7 +23,7 @@
 
 | Philips 8FF3WMI Bilderrahmen | TP-Link Router (WLAN) |
 |:---:|:---:|
-| <img src="https://raw.githubusercontent.com/basecore/kicktipp-photoframe/3dced20f3089dd632787516a95a9d18826b24cb2/sources/IMG/frame.jpg" width="280"> | <img src="https://raw.githubusercontent.com/basecore/siemens-kantine-photoframe/main/sources/IMG/router.jpg" width="280"> |
+| <img src="(https://github.com/basecore/siemens-kantine-photoframe/blob/75c66b2dbbba792f24907258df12376eb246aac6/sources/IMG/frame.jpg)" width="280"> | <img src="https://raw.githubusercontent.com/basecore/siemens-kantine-photoframe/main/sources/IMG/router.jpg" width="280"> |
 
 - **Bilderrahmen:** Philips 8FF3WMI, 800 × 600 px, RSS-Feed-Unterstützung
 - **Netzwerk:** Der Rahmen hängt per WLAN am TP-Link Router
