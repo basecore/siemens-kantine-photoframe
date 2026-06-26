@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Siemens Kantine Regensburg – 1200x800 JPEG.
+"""Siemens Kantine Regensburg – 800x600 JPEG (Bilderrahmen-Auflösung).
 
 Scraping strategy (DOM-based, not innerText):
   1. warmup(): load base URL, dismiss cookie banner, open the Angular
@@ -14,7 +14,7 @@ Scraping strategy (DOM-based, not innerText):
   3. "oder"-alternative only shown when the alternative name differs from
      the main dish name (case-insensitive).
   4. Fallback chain: DOM-query → innerText line-parser (legacy).
-  5. WEEK_OFFSET env var (default 0): set to 1 to scrape next week (KW27).
+  5. WEEK_OFFSET env var (default 1): 0=current week, 1=next week.
      When offset > 0 all days of that week are scraped (no "past" filter).
 """
 import os, re, json
@@ -28,13 +28,13 @@ from PIL import Image, ImageDraw, ImageFont
 URL_BASE    = os.environ.get("CATERINGPORTAL_URL",
                               "https://siemens.cateringportal.io/menu/Regensburg/Mittagessen")
 _SID        = os.environ.get("CATERINGPORTAL_SID", "").strip()
-WEEK_OFFSET = int(os.environ.get("WEEK_OFFSET", "0"))
+WEEK_OFFSET = int(os.environ.get("WEEK_OFFSET", "1"))   # 0=aktuelle Woche, 1=nächste Woche
 
 OUT_DIR  = Path("docs/images")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 MAX_KEEP = 8
-W, H     = 1200, 800
-FOOTER_H = 26
+W, H     = 800, 600      # Bilderrahmen-native Auflösung
+FOOTER_H = 20
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 BLUE  = (0, 57, 107);    LIGHT = (0, 119, 193)
@@ -44,8 +44,8 @@ C_TXT = (30, 30, 30);   WHITE  = (255, 255, 255)
 GRID  = (190, 210, 230)
 C_HOL_BG  = (220, 220, 220); C_HOL_HDR = (140, 140, 140); C_HOL_TXT = (100, 100, 100)
 C_PAST_BG = (235, 235, 235); C_PAST_TXT = (160, 160, 160)
-C_TODAY   = (255, 200, 0)    # gold highlight border for today
-C_TODAY_HDR = (220, 150, 0)  # darker gold for header background of today
+C_TODAY   = (255, 200, 0)
+C_TODAY_HDR = (220, 150, 0)
 
 _FREG = ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
          "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"]
@@ -158,99 +158,56 @@ def switch_to_german(page):
     global _LANG_STORAGE
     before = _snap(page)
 
-    # ── Step 1: selectors for the TRIGGER button (opens the language menu) ──
-    # Ordered from most specific to broadest.
     TRIGGER_SELS = [
-        # explicit aria-label on the trigger
-        "button[aria-label='language']",
-        "button[aria-label='Language']",
-        "button[aria-label*='language' i]",
-        "button[aria-label*='sprache' i]",
-        # trigger shows the current-language flag image inside a button
-        "button:has(img[src*='flags/'])",
-        "button:has(img[src*='en-US'])",
-        "button:has(img[alt='English'])",
-        "button:has(img[title='English'])",
-        # text-based fallbacks
-        "button:has-text('English')",
-        "button:has-text('EN')",
-        # mat-select (some portal variants)
+        "button[aria-label='language']", "button[aria-label='Language']",
+        "button[aria-label*='language' i]", "button[aria-label*='sprache' i]",
+        "button:has(img[src*='flags/'])", "button:has(img[src*='en-US'])",
+        "button:has(img[alt='English'])", "button:has(img[title='English'])",
+        "button:has-text('English')", "button:has-text('EN')",
         "mat-select[aria-label*='lang' i]",
     ]
-
-    # ── Step 2: selectors for the DE button INSIDE the open mat-menu ──
-    # These elements only exist in the DOM after the trigger has been clicked.
     DE_SELS = [
-        "button[aria-label='Deutsch']",
-        "button[lang='de-DE']",
-        "button[value='de-DE']",
-        "[role='menuitem'][aria-label='Deutsch']",
+        "button[aria-label='Deutsch']", "button[lang='de-DE']",
+        "button[value='de-DE']", "[role='menuitem'][aria-label='Deutsch']",
         "[role='menuitem'][lang='de-DE']",
     ]
 
-    # ── Helper: wait for mat-menu overlay, then click DE ──────────────────
     def _wait_for_menu_and_click_de():
-        """
-        After the trigger click, Angular attaches the mat-menu panel to the
-        document body (as <div class="mat-mdc-menu-panel"> or similar).
-        We wait for it to appear, then look for the Deutsch button inside it.
-        """
-        OVERLAY_SELS = [
-            ".mat-mdc-menu-panel",
-            ".mat-menu-panel",
-            "[class*='mat-menu']",
-            "div[role='menu']",
-        ]
+        OVERLAY_SELS = [".mat-mdc-menu-panel",".mat-menu-panel","[class*='mat-menu']","div[role='menu']"]
         overlay_found = False
         for osel in OVERLAY_SELS:
             try:
                 page.wait_for_selector(osel, timeout=3000, state="attached")
                 print(f"  [lang] mat-menu overlay found via {osel!r}")
-                overlay_found = True
-                break
+                overlay_found = True; break
             except: pass
         if not overlay_found:
             print("  [lang] mat-menu overlay not detected, trying DE button anyway")
-
-        # Now try to click the DE button (it should be visible in the overlay)
         for sel in DE_SELS:
             try:
                 el = page.wait_for_selector(sel, timeout=3000, state="visible")
                 if el:
-                    el.click()
-                    print(f"  [lang] ✓ clicked DE button via {sel!r}")
-                    return True
+                    el.click(); print(f"  [lang] ✓ clicked DE button via {sel!r}"); return True
             except: pass
-
-        # Last-resort JS click on the flag image parent button
         print("  [lang] DE selectors failed, trying JS click on de-DE flag img...")
         result = page.evaluate(r"""
         (function(){
-          var img = document.querySelector(
-            "img[src*='de-DE'], img[alt='Deutsch'], img[title='Deutsch']"
-          );
-          if (!img) return 'de-DE img not found';
-          var btn = img.closest('button,[role="menuitem"],[role="option"],a')
-                    || img.parentElement;
-          btn.click();
-          return 'JS-clicked: ' + btn.tagName + ' | ' + (img.src || '');
+          var img=document.querySelector("img[src*='de-DE'],img[alt='Deutsch'],img[title='Deutsch']");
+          if(!img)return 'de-DE img not found';
+          var btn=img.closest('button,[role="menuitem"],[role="option"],a')||img.parentElement;
+          btn.click();return 'JS-clicked:'+btn.tagName+'|'+(img.src||'');
         })()
         """)
         print(f"  [lang] JS fallback result: {result}")
         return "not found" not in result
 
-    # ── Step 3: attempt language switch ──────────────────────────────────
     switched = False
-
-    # First check if the DE button is already directly visible (no trigger needed)
     for sel in DE_SELS:
         try:
             el = page.wait_for_selector(sel, timeout=800, state="visible")
             if el:
-                el.click()
-                print(f"  [lang] ✓ DE button already visible, clicked via {sel!r}")
-                switched = True
-                break
+                el.click(); print(f"  [lang] ✓ DE button already visible, clicked via {sel!r}")
+                switched = True; break
         except: pass
 
     if not switched:
@@ -260,71 +217,50 @@ def switch_to_german(page):
             try:
                 page.click(tsel, timeout=2500)
                 print(f"  [lang] ✓ trigger clicked via {tsel!r}")
-                page.wait_for_timeout(600)
-                trigger_opened = True
-                break
+                page.wait_for_timeout(600); trigger_opened = True; break
             except: pass
-
         if not trigger_opened:
-            # Absolute fallback: JS-click any button containing a flags/ image
             print("  [lang] no trigger selector matched, trying JS flag-button click...")
             result = page.evaluate(r"""
             (function(){
-              var imgs = Array.from(document.querySelectorAll("img[src*='flags/']"));
-              for (var img of imgs) {
-                var btn = img.closest('button,[role="button"]') || img.parentElement;
-                if (btn && btn !== img) {
-                  btn.click();
-                  return 'JS trigger clicked: ' + btn.tagName + ' | ' + (img.src || '');
-                }
-              }
-              return 'no flags img found';
+              var imgs=Array.from(document.querySelectorAll("img[src*='flags/']"));
+              for(var img of imgs){
+                var btn=img.closest('button,[role="button"]')||img.parentElement;
+                if(btn&&btn!==img){btn.click();return 'JS trigger clicked:'+btn.tagName+'|'+(img.src||'');}
+              }return 'no flags img found';
             })()
             """)
             print(f"  [lang] JS trigger fallback: {result}")
             page.wait_for_timeout(600)
-
         switched = _wait_for_menu_and_click_de()
 
     if not switched:
         print("  [lang] ✗ WARNING: could not switch to German – proceeding in English")
         return False
 
-    # ── Step 4: wait for German UI confirmation ───────────────────────────
     page.wait_for_timeout(1000)
     confirmed = False
-    for de_text_sel in [
-        "text=Suppe / Vorspeise", "text=Suppe", "text=Essen 1",
-        "h3.category-header", "text=Mittagessen",
-    ]:
+    for de_text_sel in ["text=Suppe / Vorspeise","text=Suppe","text=Essen 1","h3.category-header","text=Mittagessen"]:
         try:
             page.wait_for_selector(de_text_sel, timeout=3500)
             print(f"  [lang] ✓ German UI confirmed via {de_text_sel!r}")
-            confirmed = True
-            break
+            confirmed = True; break
         except: pass
     if not confirmed:
         print("  [lang] German UI not yet confirmed (may appear after navigation)")
 
-    # ── Step 5: capture localStorage diff for re-injection ───────────────
     after = _snap(page)
     diff  = {k: v for k, v in after.items() if before.get(k) != v}
     if diff:
         _LANG_STORAGE = diff
         print(f"  [lang] localStorage diff captured: {dict(diff)}")
     else:
-        # No diff: inject a broad set of canonical DE language keys.
-        # One of them will usually be the key the app actually reads.
         _LANG_STORAGE = {k: 'de-DE' for k in [
-            'language', 'locale', 'lang', 'i18n',
-            'selectedLanguage', 'appLanguage', 'selectedLocale',
-            'userLanguage', 'NG_TRANSLATE_LANG_KEY',
+            'language','locale','lang','i18n','selectedLanguage','appLanguage',
+            'selectedLocale','userLanguage','NG_TRANSLATE_LANG_KEY',
         ]}
-        _LANG_STORAGE.update({k: 'de' for k in [
-            'language', 'locale', 'lang',
-        ]})
+        _LANG_STORAGE.update({k: 'de' for k in ['language','locale','lang']})
         print(f"  [lang] no localStorage diff – injecting {len(_LANG_STORAGE)} fallback keys")
-
     return confirmed or switched
 
 
@@ -574,7 +510,7 @@ def scrape_day(page, date_obj):
 
 
 # ── Render helpers ─────────────────────────────────────────────────────────────
-def wrap_text(draw,text,f,max_w,max_lines=4):
+def wrap_text(draw,text,f,max_w,max_lines=3):
     out,cur=[],[]
     for w in text.split():
         t=' '.join(cur+[w])
@@ -607,19 +543,29 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
            monday_date, source=''):
     img=Image.new('RGB',(W,H),(255,255,255))
     d=ImageDraw.Draw(img)
-    ftit  = lf(20, True)
-    fdate = lf(14)
-    fday  = lf(17, True)
-    ftxt  = lf(17)
-    fsmall= lf(14)
-    fbdg  = lf(13, True)
-    fprc  = lf(14)
-    fftr  = lf(10)
-    fstb  = lf(13, True)
 
-    HDR_H=56; DAY_H=30; LEGEND_H=24; STUB_W=60
-    TODAY_BW=3
+    # ── Fonts – generously sized for a small 800x600 photo frame ────────────
+    ftit  = lf(22, True)   # header title
+    fdate = lf(13)         # date range subtitle in header
+    fday  = lf(19, True)   # day column headers (Mo 23.06 etc.)
+    ftxt  = lf(19)         # main dish name
+    fsmall= lf(15)         # oder-alternative
+    fbdg  = lf(15, True)   # vegan/veg badge
+    fprc  = lf(16, True)   # price  ← extra large & bold
+    fftr  = lf(11)         # footer
+    fstb  = lf(15, True)   # row stub label (vertical)
 
+    # ── Layout constants ──────────────────────────────────────────────
+    HDR_H   = 52    # header bar height
+    DAY_H   = 34    # day-label row height
+    LEGEND_H= 22    # legend bar height at bottom
+    STUB_W  = 46    # left stub column width
+    TODAY_BW= 3     # gold border width for today column
+    LH_TXT  = 23    # line height for ftxt (19pt)
+    LH_SML  = 19    # line height for fsmall (15pt)
+    PAD     = 6
+
+    # ── Header ───────────────────────────────────────────────────
     d.rectangle([(0,0),(W,HDR_H)],fill=BLUE)
     friday_date = monday_date + timedelta(4)
     date_range  = f"{monday_date.strftime('%d.%m.%Y')} – {friday_date.strftime('%d.%m.%Y')}"
@@ -628,12 +574,13 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
     title_h=bt[3]-bt[1]
     bd=d.textbbox((0,0),date_range,font=fdate)
     date_h=bd[3]-bd[1]
-    total_h=title_h+4+date_h
+    total_h=title_h+3+date_h
     ty=(HDR_H-total_h)//2
     d.text(((W-(bt[2]-bt[0]))//2, ty), title_str, font=ftit, fill=WHITE)
-    d.text(((W-(bd[2]-bd[0]))//2, ty+title_h+4), date_range, font=fdate, fill=(180,210,240))
+    d.text(((W-(bd[2]-bd[0]))//2, ty+title_h+3), date_range, font=fdate, fill=(180,210,240))
     y=HDR_H
 
+    # ── Day header row ────────────────────────────────────────────
     all_days=list(holiday_map.keys()); dw=(W-STUB_W)//len(all_days)
     d.rectangle([(0,y),(STUB_W-1,y+DAY_H-1)],fill=BLUE)
     for i,day in enumerate(all_days):
@@ -647,19 +594,23 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
         else:           col = LIGHT
         d.rectangle([(x,y),(x+dw-1,y+DAY_H-1)],fill=col)
         b=d.textbbox((0,0),day,font=fday)
-        d.text((x+(dw-(b[2]-b[0]))//2,y+(DAY_H-(b[3]-b[1]))//2),day,font=fday,fill=WHITE)
+        d.text((x+(dw-(b[2]-b[0]))//2, y+(DAY_H-(b[3]-b[1]))//2), day, font=fday, fill=WHITE)
         d.line([(x,y),(x,y+DAY_H)],fill=BLUE,width=1)
         if is_today:
             d.line([(x,y),(x+dw,y)],fill=C_TODAY,width=TODAY_BW)
     y+=DAY_H
 
+    # ── Row heights ───────────────────────────────────────────────
     avail=H-y-FOOTER_H-LEGEND_H-4
-    rs=int(avail*0.17); re_=(avail-rs)//3
+    rs=int(avail*0.17)          # Suppe: ~17 % of available height
+    re_=(avail-rs)//3           # each Essen row
     ROW_H={'Suppe':rs,'Essen 1':re_,'Essen 2':re_,'Essen 3':avail-rs-2*re_}
 
+    # ── Data rows ─────────────────────────────────────────────────
     for ri,cat in enumerate(CATS):
         rh=ROW_H[cat]
         d.line([(0,y),(W,y)],fill=GRID,width=1)
+        # stub
         d.rectangle([(0,y),(STUB_W-1,y+rh-1)],fill=BLUE)
         lbl=CAT_LABEL[cat]
         b=d.textbbox((0,0),lbl,font=fstb)
@@ -674,10 +625,10 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
             is_past = _is_past(day, today_date)
             is_today= _is_today(day, today_date)
 
-            if is_past:         bg = C_PAST_BG
-            elif is_hol:        bg = C_HOL_BG
-            elif is_today:      bg = (255, 253, 230)
-            else:               bg = R_ODD if ri%2==0 else R_EVEN
+            if is_past:     bg = C_PAST_BG
+            elif is_hol:    bg = C_HOL_BG
+            elif is_today:  bg = (255, 253, 230)
+            else:           bg = R_ODD if ri%2==0 else R_EVEN
 
             d.rectangle([(x,y),(x+dw-1,y+rh-1)],fill=bg)
             d.line([(x,y),(x,y+rh)],fill=GRID,width=1)
@@ -688,7 +639,7 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
             if is_past:
                 if ri==0:
                     b=d.textbbox((0,0),'vergangen',font=fprc)
-                    d.text((x+(dw-(b[2]-b[0]))//2,y+rh//2-8),'vergangen',font=fprc,fill=C_PAST_TXT)
+                    d.text((x+(dw-(b[2]-b[0]))//2,y+rh//2-10),'vergangen',font=fprc,fill=C_PAST_TXT)
                 continue
             if is_hol:
                 if ri==0:
@@ -701,14 +652,13 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
                     cy=by+bh+5
                     for ln in wrap_text(d,hn,ftxt,dw-8,3):
                         b2=d.textbbox((0,0),ln,font=ftxt)
-                        d.text((x+(dw-(b2[2]-b2[0]))//2,cy),ln,font=ftxt,fill=C_HOL_TXT);cy+=19
+                        d.text((x+(dw-(b2[2]-b2[0]))//2,cy),ln,font=ftxt,fill=C_HOL_TXT);cy+=LH_TXT
                 continue
 
-            PAD=6
             items=[it for it in week_data.get(day,[]) if it['kategorie']==cat]
             if not items:
                 b=d.textbbox((0,0),'–',font=ftxt)
-                d.text((x+(dw-(b[2]-b[0]))//2,y+rh//2-9),'–',font=ftxt,fill=(180,180,180))
+                d.text((x+(dw-(b[2]-b[0]))//2,y+rh//2-11),'–',font=ftxt,fill=(180,180,180))
                 continue
 
             it=items[0]; cx=x+PAD; cy=y+PAD; avw=dw-2*PAD
@@ -716,42 +666,46 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
                 bl='Vegan' if it['vv']=='VG' else 'Veg.'
                 bc=C_VG if it['vv']=='VG' else C_V
                 b=d.textbbox((0,0),bl,font=fbdg)
-                bw=b[2]-b[0]+7;bh2=b[3]-b[1]+4
+                bw=b[2]-b[0]+8;bh2=b[3]-b[1]+5
                 d.rounded_rectangle([(cx,cy),(cx+bw,cy+bh2)],radius=3,fill=bc)
-                d.text((cx+4,cy+2),bl,font=fbdg,fill=WHITE);cy+=bh2+4
+                d.text((cx+4,cy+2),bl,font=fbdg,fill=WHITE);cy+=bh2+5
 
             oder=it.get('oder','')
-            space_oder=(2*17) if oder else 0
-            avail_name=rh-(cy-y)-18-space_oder
-            max_ln=max(1,min(4,avail_name//19))
+            space_oder=(2*LH_SML) if oder else 0
+            avail_name=rh-(cy-y)-LH_TXT-space_oder
+            max_ln=max(1,min(3,avail_name//LH_TXT))
             for ln in wrap_text(d,it['name'],ftxt,avw,max_ln):
-                d.text((cx,cy),ln,font=ftxt,fill=C_TXT);cy+=19
+                d.text((cx,cy),ln,font=ftxt,fill=C_TXT);cy+=LH_TXT
             if oder:
                 for ln in wrap_text(d,f"oder: {oder}",fsmall,avw,2):
-                    d.text((cx,cy),ln,font=fsmall,fill=(80,120,180));cy+=17
+                    d.text((cx,cy),ln,font=fsmall,fill=(80,120,180));cy+=LH_SML
             if it['preis_int']:
                 pl=f"Int: {it['preis_int']}"
                 b=d.textbbox((0,0),pl,font=fprc)
-                d.text((x+dw-(b[2]-b[0])-PAD,y+rh-(b[3]-b[1])-4),pl,font=fprc,fill=LIGHT)
+                d.text((x+dw-(b[2]-b[0])-PAD, y+rh-(b[3]-b[1])-4), pl, font=fprc, fill=LIGHT)
 
             if is_today:
                 d.line([(x,y+rh-1),(x+dw,y+rh-1)],fill=C_TODAY,width=TODAY_BW)
         y+=rh
 
+    # close today column bottom border
     for i,day in enumerate(all_days):
         if _is_today(day,today_date):
             x=STUB_W+i*dw
             d.line([(x,y),(x+dw,y)],fill=C_TODAY,width=TODAY_BW)
 
+    # ── Legend bar ───────────────────────────────────────────────
     d.line([(0,y),(W,y)],fill=GRID,width=1);y+=1
     d.rectangle([(0,y),(W,y+LEGEND_H)],fill=(245,249,253))
-    lx=8
+    lx=6
+    fleg=lf(12)   # slightly larger legend font
     for col,txt in [(C_VG,'Vegan'),(C_V,'Vegetarisch'),(C_HOL_HDR,'Feiertag'),
                     (C_PAST_BG,'vergangen'),(C_TODAY,'Heute')]:
-        d.rectangle([(lx,y+6),(lx+14,y+16)],fill=col)
-        b=d.textbbox((0,0),txt,font=fprc)
-        d.text((lx+18,y+5),txt,font=fprc,fill=C_TXT);lx+=18+(b[2]-b[0])+18
-    d.text((lx,y+5),'Int = Mitarbeiterpreis',font=fprc,fill=(120,120,120))
+        d.rectangle([(lx,y+5),(lx+12,y+15)],fill=col)
+        b=d.textbbox((0,0),txt,font=fleg)
+        d.text((lx+15,y+4),txt,font=fleg,fill=C_TXT);lx+=15+(b[2]-b[0])+12
+    d.text((lx,y+4),'Int = Mitarbeiterpreis',font=fleg,fill=(120,120,120))
+
     _footer(d,kw,label,local_dt,fftr,source)
     return img
 
@@ -763,7 +717,7 @@ def _footer(d,kw,label,local_dt,f,source=''):
          f"siemens.cateringportal.io{src}")
     d.rectangle([(0,H-FOOTER_H),(W,H)],fill=BLUE)
     b=d.textbbox((0,0),txt,font=f)
-    d.text(((W-(b[2]-b[0]))//2,H-18),txt,font=f,fill=WHITE)
+    d.text(((W-(b[2]-b[0]))//2, H-FOOTER_H+(FOOTER_H-(b[3]-b[1]))//2), txt, font=f, fill=WHITE)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
