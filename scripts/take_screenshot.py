@@ -346,7 +346,7 @@ def parse_dom_result(raw_json):
                 if _names_differ(main_dish['name'],name):
                     main_dish['oder']=name
                     main_dish['oder_preis']=p['intPrice']
-                    main_dish['oder_vv']=vv_from_name(name)   # ← FIX: Veg-Badge für oder
+                    main_dish['oder_vv']=vv_from_name(name)
                     print(f"    [parse] oder: {name!r} vv={main_dish['oder_vv']!r}")
                 else:
                     print(f"    [parse] skip dup oder: {name!r}")
@@ -437,7 +437,7 @@ JS_CLICK_TAB=r"""
 })
 """
 JS_TAB_TEXT=r"""
-(function(){var panels=Array.from(document.querySelectorAll('mat-tab-nav-panel,[role="tabpanel"],mat-tab-body'));var active=panels.find(p=>{var s=window.getComputedStyle(p);return s.display!=='none'&&s.visibility!=='hidden'&&p.offsetHeight>0;})||panels[0];if(!active){var b=document.body.cloneNode(true);b.querySelectorAll('script,style,noscript').forEach(e=>e.remove());return b.innerText||b.textContent||'';}return active.innerText||active.textContent||'';}())
+(function(){var panels=Array.from(document.querySelectorAll('mat-tab-nav-panel,[role="tabpanel"],mat-tab-body'));var active=panels.find(p=>{var s=window.getComputedStyle(p);return s.display!=='none'&&s.visibility!=='hidden'&&p.offsetHeight>0;})||panels[0];if(!active){var b=document.body.cloneNode(true);b.querySelectorAll('script,style,noscript').forEach(e=>e.remove());return b.innerText||b.textContent||'';}return active.innerText||active.textContent||'';})()
 """
 
 # ── Scrape one day ────────────────────────────────────────────────────────────
@@ -498,18 +498,63 @@ def scrape_day(page, date_obj):
 
 
 # ── Render helpers ─────────────────────────────────────────────────────────────
-def wrap_text(draw,text,f,max_w,max_lines=3):
-    out,cur=[],[]
-    for w in text.split():
-        t=' '.join(cur+[w])
-        b=draw.textbbox((0,0),t,font=f)
-        if b[2]-b[0]<=max_w: cur.append(w)
+
+def _split_long_word(draw, word, font, max_w):
+    """Teilt ein einzelnes Wort mit Bindestrich auf, wenn es breiter als max_w ist.
+    Gibt eine Liste von Teilen zurück (letzter Teil ohne Bindestrich)."""
+    parts = []
+    while word:
+        # Finde maximale Zeichenanzahl die reinpasst (mit '-' am Ende)
+        lo, hi = 1, len(word)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            test = word[:mid] + ('-' if mid < len(word) else '')
+            b = draw.textbbox((0, 0), test, font=font)
+            if b[2] - b[0] <= max_w:
+                lo = mid
+            else:
+                hi = mid - 1
+        if lo <= 0:
+            lo = 1  # Mindestens 1 Zeichen pro Zeile
+        chunk = word[:lo]
+        word  = word[lo:]
+        parts.append(chunk + ('-' if word else ''))
+    return parts
+
+
+def wrap_text(draw, text, f, max_w, max_lines=3):
+    """Bricht Text an Leerzeichen um; zerlegt Wörter die breiter als max_w sind
+    per Bindestrich-Silbentrennung."""
+    # Zuerst: alle Wörter ggf. in Teilwörter splitten
+    tokens = []
+    for word in text.split():
+        b = draw.textbbox((0, 0), word, font=f)
+        if b[2] - b[0] > max_w:
+            tokens.extend(_split_long_word(draw, word, f, max_w))
+        else:
+            tokens.append(word)
+
+    out, cur = [], []
+    for tok in tokens:
+        # Tokens die bereits mit '-' enden (abgetrennte Hälften): eigene Zeile
+        b_tok = draw.textbbox((0, 0), tok, font=f)
+        if tok.endswith('-') and b_tok[2] - b_tok[0] > max_w * 0.5:
+            if cur: out.append(' '.join(cur)); cur = []
+            out.append(tok)
+            continue
+        t = ' '.join(cur + [tok])
+        b = draw.textbbox((0, 0), t, font=f)
+        if b[2] - b[0] <= max_w:
+            cur.append(tok)
         else:
             if cur: out.append(' '.join(cur))
-            cur=[w]
-        if len(out)>=max_lines-1 and cur: break
-    if cur: out.append(' '.join(cur))
+            cur = [tok]
+        if len(out) >= max_lines - 1 and cur:
+            break
+    if cur:
+        out.append(' '.join(cur))
     return out[:max_lines]
+
 
 def _is_past(day_key_str, today_date):
     try:
@@ -532,29 +577,26 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
     img=Image.new('RGB',(W,H),(255,255,255))
     d=ImageDraw.Draw(img)
 
-    # ── Fonts ────────────────────────────────────────────────────────────────
-    ftit  = lf(22, True)   # header title
-    fdate = lf(13)         # date range subtitle
-    fday  = lf(19, True)   # day column headers
-    ftxt  = lf(19)         # main dish name
-    fsmall= lf(15)         # oder-alternative
-    fbdg  = lf(14, True)   # vegan/veg badge
-    fprc  = lf(16, True)   # price – bold & large
-    fftr  = lf(11)         # footer
-    fstb  = lf(11, True)   # stub label (fits narrow column at 11pt)
-    fleg  = lf(12)         # legend
+    ftit  = lf(22, True)
+    fdate = lf(13)
+    fday  = lf(19, True)
+    ftxt  = lf(19)
+    fsmall= lf(15)
+    fbdg  = lf(14, True)
+    fprc  = lf(16, True)
+    fftr  = lf(11)
+    fstb  = lf(11, True)
+    fleg  = lf(12)
 
-    # ── Layout ───────────────────────────────────────────────────────────────
     HDR_H   = 52
     DAY_H   = 34
     LEGEND_H= 22
-    STUB_W  = 38   # narrow enough, labels are now abbreviated (Su./E1/E2/E3)
+    STUB_W  = 38
     TODAY_BW= 3
     LH_TXT  = 23
     LH_SML  = 19
     PAD     = 6
 
-    # ── Header ───────────────────────────────────────────────────────────────
     d.rectangle([(0,0),(W,HDR_H)],fill=BLUE)
     friday_date = monday_date + timedelta(4)
     date_range  = f"{monday_date.strftime('%d.%m.%Y')} – {friday_date.strftime('%d.%m.%Y')}"
@@ -569,7 +611,6 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
     d.text(((W-(bd[2]-bd[0]))//2, ty+title_h+3), date_range, font=fdate, fill=(180,210,240))
     y=HDR_H
 
-    # ── Day header row ────────────────────────────────────────────────────────
     all_days=list(holiday_map.keys()); dw=(W-STUB_W)//len(all_days)
     d.rectangle([(0,y),(STUB_W-1,y+DAY_H-1)],fill=BLUE)
     for i,day in enumerate(all_days):
@@ -589,18 +630,15 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
             d.line([(x,y),(x+dw,y)],fill=C_TODAY,width=TODAY_BW)
     y+=DAY_H
 
-    # ── Row heights ───────────────────────────────────────────────────────────
     avail=H-y-FOOTER_H-LEGEND_H-4
     rs=int(avail*0.17)
     re_=(avail-rs)//3
     ROW_H={'Suppe':rs,'Essen 1':re_,'Essen 2':re_,'Essen 3':avail-rs-2*re_}
 
-    # ── Data rows ─────────────────────────────────────────────────────────────
     for ri,cat in enumerate(CATS):
         rh=ROW_H[cat]
         d.line([(0,y),(W,y)],fill=GRID,width=1)
 
-        # stub – abbreviated label rotated 90°
         d.rectangle([(0,y),(STUB_W-1,y+rh-1)],fill=BLUE)
         lbl=CAT_LABEL[cat]
         b=d.textbbox((0,0),lbl,font=fstb)
@@ -655,7 +693,6 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
 
             it=items[0]; cx=x+PAD; cy=y+PAD; avw=dw-2*PAD
 
-            # ── main dish vv badge ────────────────────────────────────────────
             if it['vv']:
                 bl='Vegan' if it['vv']=='VG' else 'Veg.'
                 bc=C_VG if it['vv']=='VG' else C_V
@@ -666,13 +703,12 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
 
             oder=it.get('oder','')
             oder_vv=it.get('oder_vv','')
-            space_oder=(LH_SML+6) if oder else 0   # 1 line for oder text + badge row
+            space_oder=(LH_SML+6) if oder else 0
             avail_name=rh-(cy-y)-LH_TXT-space_oder
             max_ln=max(1,min(3,avail_name//LH_TXT))
             for ln in wrap_text(d,it['name'],ftxt,avw,max_ln):
                 d.text((cx,cy),ln,font=ftxt,fill=C_TXT);cy+=LH_TXT
 
-            # ── oder line with optional vv badge ─────────────────────────────
             if oder:
                 ocx=cx
                 if oder_vv:
@@ -700,7 +736,6 @@ def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
             x=STUB_W+i*dw
             d.line([(x,y),(x+dw,y)],fill=C_TODAY,width=TODAY_BW)
 
-    # ── Legend bar ────────────────────────────────────────────────────────────
     d.line([(0,y),(W,y)],fill=GRID,width=1);y+=1
     d.rectangle([(0,y),(W,y+LEGEND_H)],fill=(245,249,253))
     lx=6
@@ -729,8 +764,6 @@ def _footer(d,kw,label,local_dt,f,source=''):
 def main():
     now=datetime.now(timezone.utc); local=german_time(now)
     today_date=local.date()
-    # FIX: weekday() auf dem date-Objekt, nicht auf dem datetime – vermeidet
-    # DST-Verschiebungen die local.weekday() von today_date.weekday() abweichen lassen
     target_monday=today_date - timedelta(days=today_date.weekday()) + timedelta(weeks=WEEK_OFFSET)
     label,kw=kw_label(datetime.combine(target_monday,datetime.min.time(),tzinfo=timezone.utc))
     out_path=OUT_DIR/f'kantine_{label}.jpg'

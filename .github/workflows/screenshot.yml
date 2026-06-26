@@ -6,7 +6,7 @@ on:
       week_offset:
         description: '0 = current week, 1 = next week'
         required: false
-        default: '0'
+        default: '1'
   schedule:
     # Mo-Fr 05:30 UTC = 07:30 CEST  → aktuelle Woche (verbleibende Tage)
     - cron: '30 5 * * 1-5'
