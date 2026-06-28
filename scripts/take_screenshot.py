@@ -14,10 +14,8 @@ Scraping strategy (DOM-based, not innerText):
   3. "oder"-alternative shown with prefix "oder" only when an explicit
      "oder"-separator product was scraped; otherwise prefix is "mit".
   4. Fallback chain: DOM-query → innerText line-parser (legacy).
-  5. WEEK_OFFSET env var overrides auto-detection:
-       auto (default): Mo–Fr<14h → aktuelle Woche (0),
-                       Fr≥14h / Sa / So → nächste Woche (1).
-     Set WEEK_OFFSET=0 or =1 to force a specific week.
+  5. WEEK_OFFSET env var (default 1): 0=current week, 1=next week.
+     When offset > 0 all days of that week are scraped (no "past" filter).
   6. Unknown categories (Vegan, Vegetarisch, Fisch, …) map to their
      semantic target slot (Vegan/Veg.→E2, Fisch→E3); only if that slot is
      already taken do we fall forward to the next free slot.
@@ -38,14 +36,10 @@ from playwright.sync_api import sync_playwright
 from PIL import Image, ImageDraw, ImageFont
 
 # ── Config ────────────────────────────────────────────────────────────────────
-URL_BASE = os.environ.get("CATERINGPORTAL_URL",
-                          "https://siemens.cateringportal.io/menu/Regensburg/Mittagessen")
-_SID     = os.environ.get("CATERINGPORTAL_SID", "").strip()
-# WEEK_OFFSET: wenn gesetzt, überschreibt die Auto-Logik.
-# Auto-Logik: Fr >=14 Uhr / Sa / So → 1 (nächste Woche), sonst 0 (aktuelle Woche).
-_WEEK_OFFSET_ENV = os.environ.get("WEEK_OFFSET", "").strip()
-
-FRIDAY_NEXT_WEEK_HOUR = 14  # ab dieser Stunde (Berliner Zeit) am Freitag gilt: nächste Woche
+URL_BASE    = os.environ.get("CATERINGPORTAL_URL",
+                              "https://siemens.cateringportal.io/menu/Regensburg/Mittagessen")
+_SID        = os.environ.get("CATERINGPORTAL_SID", "").strip()
+WEEK_OFFSET = int(os.environ.get("WEEK_OFFSET", "1"))   # 0=aktuelle Woche, 1=nächste Woche
 
 OUT_DIR  = Path("docs/images")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -120,19 +114,6 @@ def kw_label(dt):
 
 def day_key(dt_obj):
     return f"{'Mo Di Mi Do Fr'.split()[dt_obj.weekday()]} {dt_obj.strftime('%d.%m')}"
-
-def auto_week_offset(local_dt):
-    """Dynamischer WEEK_OFFSET:
-    - Sa (5) oder So (6)          → 1 (nächste Woche)
-    - Fr (4) und Stunde >= 14     → 1 (nächste Woche)
-    - Alles andere                 → 0 (aktuelle Woche)
-    """
-    wd = local_dt.weekday()  # 0=Mo, 4=Fr, 5=Sa, 6=So
-    if wd >= 5:
-        return 1
-    if wd == 4 and local_dt.hour >= FRIDAY_NEXT_WEEK_HOUR:
-        return 1
-    return 0
 
 # ── localStorage helpers ───────────────────────────────────────────────────────
 _LANG_STORAGE: dict = {}
@@ -334,6 +315,8 @@ CAT_NORM_FIXED = {
     'essen 2':'Essen 2','food 2':'Essen 2','gericht 2':'Essen 2',
     'essen 3':'Essen 3','food 3':'Essen 3','gericht 3':'Essen 3',
 }
+# Semantic target slot per flexible category.
+# norm_cat() always tries the target first; only falls forward if taken.
 CAT_FLEXIBLE = {
     'fisch':'Essen 3','fish':'Essen 3',
     'vegan':'Essen 2','vegane':'Essen 2',
@@ -548,4 +531,483 @@ JS_TAB_TEXT=r"""
 
 # ── Scrape one day ────────────────────────────────────────────────────────────
 def scrape_day(page, date_obj):
-    url=f"{URL_BASE}/date/{date_obj.str
+    url=f"{URL_BASE}/date/{date_obj.strftime('%Y-%m-%d')}"
+    if _SID: url+=f"?ste_sid={_SID}"
+    date_label=date_obj.strftime('%d.%m')
+    print(f"\n[scrape] {url}  [{date_label}]")
+    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(800)
+    _inject(page)
+    page.wait_for_timeout(400)
+    dismiss_cookie(page)
+    found_sel=None
+    for sel in ["h3.category-header","text=Suppe / Vorspeise","text=Suppe","text=Essen 1","text=Soup / Starter","text=Food 1",".category-grid","app-category-list"]:
+        try:
+            page.wait_for_selector(sel,timeout=12000); found_sel=sel; print(f"  [wait] found: {sel!r}"); break
+        except: pass
+    if not found_sel:
+        print("  [wait] WARNING: no menu selector, extra 5s"); page.wait_for_timeout(5000)
+    try:
+        hdrs=page.evaluate("()=>Array.from(document.querySelectorAll('h3.category-header,h3')).map(h=>h.textContent.trim()).filter(Boolean)")
+        print(f"  [debug] h3 headers: {hdrs}")
+    except: pass
+    before_sig=' '.join((page.evaluate(JS_TAB_TEXT) or '').split()[:8])
+    clicked=page.evaluate(f"({JS_CLICK_TAB})('{date_label}')")
+    print(f"  [tab] click result: {clicked!r}")
+    if clicked:
+        for attempt in range(25):
+            page.wait_for_timeout(200)
+            if ' '.join((page.evaluate(JS_TAB_TEXT) or '').split()[:8])!=before_sig:
+                print(f"  [tab] content changed after {attempt+1} polls"); break
+        else: print("  [tab] content unchanged")
+    else:
+        print(f"  [tab] no tab for {date_label!r}"); page.wait_for_timeout(800)
+    try:
+        hdrs2=page.evaluate("()=>Array.from(document.querySelectorAll('h3.category-header')).map(h=>h.textContent.trim())")
+        print(f"  [debug] category-header after tab: {hdrs2}")
+    except: pass
+    dishes=[]
+    try:
+        raw_json=page.evaluate(JS_EXTRACT)
+        print(f"  [dom] JS_EXTRACT length: {len(raw_json) if raw_json else 0}")
+        if raw_json and raw_json!='[]':
+            dishes=parse_dom_result(raw_json); print(f"  [dom] {len(dishes)} dishes")
+        else: print("  [dom] empty, falling back")
+    except Exception as e: print(f"  [dom] error: {e}")
+    if not dishes:
+        raw=page.evaluate(JS_TAB_TEXT) or ''
+        lines=[l.strip() for l in raw.splitlines() if l.strip()]
+        print(f"  [fallback] {len(lines)} lines")
+        for i,l in enumerate(lines[:40]): print(f"    {i:3d}: {l[:100]}")
+        dishes=parse_flat_fallback(lines)
+    for dish in dishes:
+        zusatz_str = f" | zusatz: {dish.get('zusatz','')[:40]!r}" if dish.get('zusatz') else ''
+        oder_str = f" | {dish.get('oder_prefix','oder')}: {dish['oder'][:25]!r} vv={dish.get('oder_vv','')!r}" if dish.get('oder') else ''
+        print(f"  [result] {dish['kategorie']:8s} | vv={dish['vv']!r:3s} | {dish['name'][:35]!r}"
+              + oder_str + zusatz_str)
+    return dishes
+
+
+# ── Render helpers ─────────────────────────────────────────────────────────────
+
+def _split_long_word(draw, word, font, max_w):
+    if '-' in word:
+        parts = word.split('-')
+        chunks = []
+        cur = ''
+        for i, part in enumerate(parts):
+            candidate = (cur + '-' + part) if cur else part
+            test = candidate + ('-' if i < len(parts)-1 else '')
+            b = draw.textbbox((0,0), test, font=font)
+            if b[2]-b[0] <= max_w:
+                cur = candidate
+            else:
+                if cur: chunks.append(cur + '-')
+                cur = part
+        if cur: chunks.append(cur)
+        result = []
+        for chunk in chunks:
+            b = draw.textbbox((0,0), chunk.rstrip('-'), font=font)
+            if b[2]-b[0] > max_w:
+                result.extend(_split_chars(draw, chunk.rstrip('-'), font, max_w))
+                if chunk.endswith('-') and result:
+                    result[-1] = result[-1].rstrip('-') + '-'
+            else:
+                result.append(chunk)
+        return result
+    return _split_chars(draw, word, font, max_w)
+
+
+def _split_chars(draw, word, font, max_w):
+    parts = []
+    while word:
+        lo, hi = 1, len(word)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            test = word[:mid] + ('-' if mid < len(word) else '')
+            b = draw.textbbox((0,0), test, font=font)
+            if b[2]-b[0] <= max_w: lo = mid
+            else: hi = mid - 1
+        if lo <= 0: lo = 1
+        chunk = word[:lo]; word = word[lo:]
+        parts.append(chunk + ('-' if word else ''))
+    return parts
+
+
+def wrap_text(draw, text, f, max_w, max_lines=20):
+    tokens = []
+    for word in text.split():
+        b = draw.textbbox((0,0), word, font=f)
+        if b[2]-b[0] > max_w:
+            tokens.extend(_split_long_word(draw, word, f, max_w))
+        else:
+            tokens.append(word)
+    out, cur = [], []
+    for tok in tokens:
+        t = ' '.join(cur + [tok])
+        b = draw.textbbox((0,0), t, font=f)
+        if b[2]-b[0] <= max_w:
+            cur.append(tok)
+        else:
+            if cur: out.append(' '.join(cur))
+            cur = [tok]
+    if cur: out.append(' '.join(cur))
+    return out[:max_lines]
+
+
+def _line_h(draw, font):
+    b = draw.textbbox((0,0), 'Ag', font=font)
+    return b[3] - b[1] + 4
+
+
+def _find_uniform_font_size(draw, texts, max_w, max_h, size_start=19, size_min=10, bold=False):
+    for size in range(size_start, size_min - 1, -1):
+        f = lf(size, bold)
+        lh = _line_h(draw, f)
+        all_fit = True
+        for text in texts:
+            if not text: continue
+            lines = wrap_text(draw, text, f, max_w, max_lines=20)
+            if not lines: continue
+            if lh * len(lines) > max_h:
+                all_fit = False
+                break
+        if all_fit:
+            return size
+    return size_min
+
+
+def _fit_font(draw, text, max_w, max_h, size_start=19, size_min=10, bold=False):
+    for size in range(size_start, size_min - 1, -1):
+        f = lf(size, bold)
+        lh = _line_h(draw, f)
+        lines = wrap_text(draw, text, f, max_w, max_lines=20)
+        if not lines: return f, lh, lines
+        if lh * len(lines) <= max_h:
+            return f, lh, lines
+    f = lf(size_min, bold)
+    return f, _line_h(draw, f), wrap_text(draw, text, f, max_w, max_lines=20)
+
+
+def _is_past(day_key_str, today_date):
+    try:
+        dm=day_key_str.split(' ')[1].split('.')
+        return date(today_date.year,int(dm[1]),int(dm[0]))<today_date
+    except: return False
+
+def _is_today(day_key_str, today_date):
+    try:
+        dm=day_key_str.split(' ')[1].split('.')
+        return date(today_date.year,int(dm[1]),int(dm[0]))==today_date
+    except: return False
+
+CATS=['Suppe','Essen 1','Essen 2','Essen 3']
+
+# Single-line stub labels drawn horizontally inside the blue stub column.
+CAT_STUB = {
+    'Suppe':   'Vorspeise',
+    'Essen 1': 'Essen 1',
+    'Essen 2': 'Essen 2',
+    'Essen 3': 'Essen 3',
+}
+
+
+def _draw_stub_label(d, cat, x0, y0, stub_w, row_h, font):
+    """Draw a single-line horizontal label centred inside the blue stub area.
+    If the label is too wide, shrink font size until it fits."""
+    label = CAT_STUB[cat]
+    # Try to fit; shrink font if needed
+    for size in range(11, 6, -1):
+        f = lf(size, bold=True)
+        b = d.textbbox((0, 0), label, font=f)
+        tw = b[2] - b[0]
+        th = b[3] - b[1]
+        if tw <= stub_w - 4:
+            tx = x0 + (stub_w - tw) // 2
+            ty = y0 + (row_h - th) // 2
+            d.text((tx, ty), label, font=f, fill=WHITE)
+            return
+    # absolute fallback at size 6
+    f = lf(6, bold=True)
+    b = d.textbbox((0, 0), label, font=f)
+    tw = b[2] - b[0]; th = b[3] - b[1]
+    d.text((x0 + (stub_w - tw) // 2, y0 + (row_h - th) // 2), label, font=f, fill=WHITE)
+
+
+def render(week_data, kw, label, local_dt, url_menu, holiday_map, today_date,
+           monday_date, source=''):
+    img=Image.new('RGB',(W,H),(255,255,255))
+    d=ImageDraw.Draw(img)
+
+    ftit  = lf(22, True)
+    fdate = lf(13)
+    fday  = lf(19, True)
+    fbdg  = lf(13, True)
+    fprc  = lf(14, True)
+    fftr  = lf(11)
+    fleg  = lf(12)
+
+    HDR_H   = 52
+    DAY_H   = 34
+    LEGEND_H= 22
+    STUB_W  = 72   # wide enough for "Vorspeise" at size 9–10 bold
+    TODAY_BW= 3
+    PAD     = 5
+
+    # ── header ────────────────────────────────────────────────────────────────
+    d.rectangle([(0,0),(W,HDR_H)],fill=BLUE)
+    friday_date = monday_date + timedelta(4)
+    date_range  = f"{monday_date.strftime('%d.%m.%Y')} – {friday_date.strftime('%d.%m.%Y')}"
+    title_str   = f"Siemens Kantine Regensburg  |  KW {kw:02d}"
+    bt=d.textbbox((0,0),title_str,font=ftit)
+    title_h=bt[3]-bt[1]
+    bd=d.textbbox((0,0),date_range,font=fdate)
+    date_h=bd[3]-bd[1]
+    total_h=title_h+3+date_h
+    ty=(HDR_H-total_h)//2
+    d.text(((W-(bt[2]-bt[0]))//2, ty), title_str, font=ftit, fill=WHITE)
+    d.text(((W-(bd[2]-bd[0]))//2, ty+title_h+3), date_range, font=fdate, fill=(180,210,240))
+    y=HDR_H
+
+    # ── day headers ───────────────────────────────────────────────────────────
+    all_days=list(holiday_map.keys()); dw=(W-STUB_W)//len(all_days)
+    d.rectangle([(0,y),(STUB_W-1,y+DAY_H-1)],fill=BLUE)
+    for i,day in enumerate(all_days):
+        x=STUB_W+i*dw
+        is_hol  = holiday_map[day] is not None
+        is_past = _is_past(day, today_date)
+        is_today= _is_today(day, today_date)
+        if is_today:    col = C_TODAY_HDR
+        elif is_hol:    col = C_HOL_HDR
+        elif is_past:   col = C_PAST_TXT
+        else:           col = LIGHT
+        d.rectangle([(x,y),(x+dw-1,y+DAY_H-1)],fill=col)
+        b=d.textbbox((0,0),day,font=fday)
+        d.text((x+(dw-(b[2]-b[0]))//2, y+(DAY_H-(b[3]-b[1]))//2), day, font=fday, fill=WHITE)
+        d.line([(x,y),(x,y+DAY_H)],fill=BLUE,width=1)
+        if is_today:
+            d.line([(x,y),(x+dw,y)],fill=C_TODAY,width=TODAY_BW)
+    y+=DAY_H
+
+    avail=H-y-FOOTER_H-LEGEND_H-4
+    rs=int(avail*0.17)
+    re_=(avail-rs)//3
+    ROW_H={'Suppe':rs,'Essen 1':re_,'Essen 2':re_,'Essen 3':avail-rs-2*re_}
+
+    # ── rows ──────────────────────────────────────────────────────────────────
+    for ri,cat in enumerate(CATS):
+        rh=ROW_H[cat]
+        d.line([(STUB_W,y),(W,y)],fill=GRID,width=1)
+
+        avw = dw - 2*PAD
+        f_sm = lf(11)
+        lh_sm = _line_h(d, f_sm)
+
+        candidate_texts = []
+        for day in all_days:
+            if holiday_map[day] is not None: continue
+            if _is_past(day, today_date): continue
+            items=[it for it in week_data.get(day,[]) if it['kategorie']==cat]
+            if not items: continue
+            it = items[0]
+            badge_h = 0
+            if it['vv']:
+                b=d.textbbox((0,0),'Vegan',font=fbdg)
+                badge_h = b[3]-b[1]+4+3
+            pr_h = 0
+            if it['preis_int']:
+                pb = d.textbbox((0,0), it['preis_int'], font=fprc)
+                pr_h = pb[3]-pb[1]+4
+            extra = (1 if it.get('oder') else 0) + (1 if it.get('zusatz') else 0)
+            reserved = lh_sm * extra + pr_h + PAD
+            avail_name = rh - PAD - badge_h - reserved
+            if avail_name < 12: avail_name = 12
+            candidate_texts.append((it['name'], avail_name))
+
+        uniform_size = 19
+        if candidate_texts:
+            min_avail = min(a for _, a in candidate_texts)
+            all_names = [t for t, _ in candidate_texts]
+            uniform_size = _find_uniform_font_size(d, all_names, avw, min_avail,
+                                                    size_start=19, size_min=10)
+
+        fn_uniform = lf(uniform_size)
+        lhn_uniform = _line_h(d, fn_uniform)
+
+        for i,day in enumerate(all_days):
+            x=STUB_W+i*dw
+            is_hol  = holiday_map[day] is not None
+            is_past = _is_past(day, today_date)
+            is_today= _is_today(day, today_date)
+
+            if is_past:     bg = C_PAST_BG
+            elif is_hol:    bg = C_HOL_BG
+            elif is_today:  bg = (255, 253, 230)
+            else:           bg = R_ODD if ri%2==0 else R_EVEN
+
+            d.rectangle([(x,y),(x+dw-1,y+rh-1)],fill=bg)
+            d.line([(x,y),(x,y+rh)],fill=GRID,width=1)
+            if is_today:
+                d.line([(x,y),(x,y+rh)],fill=C_TODAY,width=TODAY_BW)
+                d.line([(x+dw-1,y),(x+dw-1,y+rh)],fill=C_TODAY,width=TODAY_BW)
+
+            if is_past:
+                if ri==0:
+                    b=d.textbbox((0,0),'vergangen',font=fprc)
+                    d.text((x+(dw-(b[2]-b[0]))//2,y+rh//2-10),'vergangen',font=fprc,fill=C_PAST_TXT)
+                continue
+            if is_hol:
+                if ri==0:
+                    hn=holiday_map[day]
+                    b=d.textbbox((0,0),'Feiertag',font=fbdg)
+                    bw=b[2]-b[0]+8;bh=b[3]-b[1]+5
+                    bx=x+(dw-bw)//2;by=y+8
+                    d.rounded_rectangle([(bx,by),(bx+bw,by+bh)],radius=4,fill=(160,160,160))
+                    d.text((bx+4,by+2),'Feiertag',font=fbdg,fill=WHITE)
+                    cy=by+bh+5
+                    fh,lhh,hlines=_fit_font(d,hn,dw-8,rh-cy+y-4)
+                    for ln in hlines:
+                        b2=d.textbbox((0,0),ln,font=fh)
+                        d.text((x+(dw-(b2[2]-b2[0]))//2,cy),ln,font=fh,fill=C_HOL_TXT);cy+=lhh
+                continue
+
+            items=[it for it in week_data.get(day,[]) if it['kategorie']==cat]
+            if not items:
+                b=d.textbbox((0,0),'–',font=lf(19))
+                d.text((x+(dw-(b[2]-b[0]))//2,y+rh//2-11),'–',font=lf(19),fill=(180,180,180))
+                continue
+
+            it=items[0]
+            cy=y+PAD
+
+            if it['vv']:
+                bl='Vegan' if it['vv']=='VG' else 'Veg.'
+                bc=C_VG if it['vv']=='VG' else C_V
+                b=d.textbbox((0,0),bl,font=fbdg)
+                bw2=b[2]-b[0]+8;bh2=b[3]-b[1]+4
+                d.rounded_rectangle([(x+PAD,cy),(x+PAD+bw2,cy+bh2)],radius=3,fill=bc)
+                d.text((x+PAD+4,cy+2),bl,font=fbdg,fill=WHITE);cy+=bh2+3
+
+            oder        = it.get('oder','')
+            oder_prefix = it.get('oder_prefix','mit')
+            oder_vv     = it.get('oder_vv','')
+            zusatz      = it.get('zusatz','')
+            zusatz_pr   = it.get('zusatz_preis','')
+
+            name_lines = wrap_text(d, it['name'], fn_uniform, avw, max_lines=20)
+            for ln in name_lines:
+                d.text((x+PAD, cy), ln, font=fn_uniform, fill=C_TXT); cy += lhn_uniform
+
+            if oder:
+                ocx = x+PAD
+                if oder_vv:
+                    obl='Vegan' if oder_vv=='VG' else 'Veg.'
+                    obc=C_VG if oder_vv=='VG' else C_V
+                    ob=d.textbbox((0,0),obl,font=fbdg)
+                    obw=ob[2]-ob[0]+6; obh=ob[3]-ob[1]+4
+                    d.rounded_rectangle([(ocx,cy),(ocx+obw,cy+obh)],radius=3,fill=obc)
+                    d.text((ocx+3,cy+2),obl,font=fbdg,fill=WHITE)
+                    ocx += obw+3
+                avail_oder = x+dw-PAD-ocx
+                oder_size = min(uniform_size, 13)
+                fo,lho,oder_lines=_fit_font(d,f"{oder_prefix}: {oder}",avail_oder,lh_sm*3,
+                                             size_start=oder_size,size_min=10)
+                for ln in oder_lines:
+                    d.text((ocx,cy),ln,font=fo,fill=(80,120,180));cy+=lho
+
+            if zusatz:
+                ztext = zusatz
+                if zusatz_pr:
+                    ztext += f"  {zusatz_pr}"
+                fz,lhz,z_lines=_fit_font(d,ztext,avw,lh_sm*3,
+                                          size_start=min(uniform_size,13),size_min=10)
+                for ln in z_lines:
+                    d.text((x+PAD,cy),ln,font=fz,fill=C_ZUSATZ);cy+=lhz
+
+            if it['preis_int']:
+                b=d.textbbox((0,0),it['preis_int'],font=fprc)
+                d.text((x+dw-(b[2]-b[0])-PAD, y+rh-(b[3]-b[1])-3), it['preis_int'], font=fprc, fill=LIGHT)
+
+            if is_today:
+                d.line([(x,y+rh-1),(x+dw,y+rh-1)],fill=C_TODAY,width=TODAY_BW)
+
+        # ── Stub: blue background + single-line label (drawn LAST) ────────
+        d.rectangle([(0,y),(STUB_W-1,y+rh-1)],fill=BLUE)
+        d.line([(STUB_W,y),(STUB_W,y+rh)],fill=GRID,width=1)
+        _draw_stub_label(d, cat, 0, y, STUB_W, rh, None)
+
+        y+=rh
+
+    # today bottom border
+    for i,day in enumerate(all_days):
+        if _is_today(day,today_date):
+            x=STUB_W+i*dw
+            d.line([(x,y),(x+dw,y)],fill=C_TODAY,width=TODAY_BW)
+
+    # ── legend ────────────────────────────────────────────────────────────────
+    d.line([(0,y),(W,y)],fill=GRID,width=1);y+=1
+    d.rectangle([(0,y),(W,y+LEGEND_H)],fill=(245,249,253))
+    lx=6
+    for col,txt in [(C_VG,'Vegan'),(C_V,'Vegetarisch'),(C_HOL_HDR,'Feiertag'),
+                    (C_PAST_BG,'vergangen'),(C_TODAY,'Heute')]:
+        d.rectangle([(lx,y+5),(lx+12,y+15)],fill=col)
+        b=d.textbbox((0,0),txt,font=fleg)
+        d.text((lx+15,y+4),txt,font=fleg,fill=C_TXT);lx+=15+(b[2]-b[0])+12
+
+    _footer(d,kw,label,local_dt,fftr,source)
+    return img
+
+
+def _footer(d,kw,label,local_dt,f,source=''):
+    src=f' – {source}' if source else ''
+    txt=(f'KW {kw:02d} / {label}  –  '
+         f"{local_dt.strftime('%d.%m.%Y %H:%M Uhr')}  –  "
+         f"siemens.cateringportal.io{src}")
+    d.rectangle([(0,H-FOOTER_H),(W,H)],fill=BLUE)
+    b=d.textbbox((0,0),txt,font=f)
+    d.text(((W-(b[2]-b[0]))//2, H-FOOTER_H+(FOOTER_H-(b[3]-b[1]))//2), txt, font=f, fill=WHITE)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    now=datetime.now(timezone.utc); local=german_time(now)
+    today_date=local.date()
+    target_monday=today_date - timedelta(days=today_date.weekday()) + timedelta(weeks=WEEK_OFFSET)
+    label,kw=kw_label(datetime.combine(target_monday,datetime.min.time(),tzinfo=timezone.utc))
+    out_path=OUT_DIR/f'kantine_{label}.jpg'
+    print(f'Week label : {label}  (KW {kw:02d})')
+    print(f'Today      : {today_date}')
+    print(f'WEEK_OFFSET: {WEEK_OFFSET}  →  scraping week of {target_monday}')
+    holiday_map=week_holiday_map(target_monday)
+    hol_days=[k for k,v in holiday_map.items() if v]
+    all_week_dates=[datetime.combine(target_monday+timedelta(i),datetime.min.time(),tzinfo=timezone.utc) for i in range(5)]
+    if WEEK_OFFSET==0:
+        scrape_dates=[dt for dt in all_week_dates if dt.date()>=today_date and day_key(dt) not in hol_days]
+    else:
+        scrape_dates=[dt for dt in all_week_dates if day_key(dt) not in hol_days]
+    print(f'Feiertage  : {[(k,holiday_map[k]) for k in hol_days] or "keine"}')
+    print(f'Scraping   : {[day_key(dt) for dt in scrape_dates]}')
+    week_data={}
+    with sync_playwright() as pw:
+        browser=pw.chromium.launch()
+        page=browser.new_page(
+            viewport={"width":1400,"height":900},
+            extra_http_headers={"Accept-Language":"de-DE,de;q=0.9,en;q=0.1"},
+        )
+        warmup(page,URL_BASE)
+        for date_obj in scrape_dates:
+            dk=day_key(date_obj)
+            dishes=scrape_day(page,date_obj)
+            if dishes: week_data[dk]=dishes
+        browser.close()
+    days_filled=len(week_data); days_avail=len(scrape_dates)
+    print(f'\nErgebnis   : {list(week_data.keys())}  ({days_filled}/{days_avail})')
+    img=render(week_data,kw,label,local,URL_BASE,holiday_map,today_date,
+               target_monday, f'DOM ({days_filled}/{days_avail} Tage)')
+    img.save(str(out_path),'JPEG',quality=92)
+    print(f'Saved: {out_path}  ({img.size[0]}x{img.size[1]})')
+    for old in sorted(OUT_DIR.glob('kantine_*.jpg'))[:-MAX_KEEP]:
+        old.unlink(); print(f'Removed: {old}')
+
+if __name__=='__main__':
+    main()
