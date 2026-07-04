@@ -10,8 +10,8 @@ echo '<?xml version="1.0" encoding="ISO-8859-1"?>';
 		<title>Siemens Kantine Regensburg – Wochenspeiseplan</title>
 		<link>http://basecore.bplaced.net</link>
 		<description></description>
-		<pubDate>Fri, 03 Jul 2026 15:02:54 +0000</pubDate>
-		<lastBuildDate>Fri, 03 Jul 2026 15:02:54 +0000</lastBuildDate>
+		<pubDate>Sat, 04 Jul 2026 10:11:30 +0000</pubDate>
+		<lastBuildDate>Sat, 04 Jul 2026 10:11:30 +0000</lastBuildDate>
 		<generator>http://basecore.bplaced.net</generator>
 		<image>
 			<url>http://basecore.bplaced.net/images/icon.jpg</url>
